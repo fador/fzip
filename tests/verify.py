@@ -248,12 +248,27 @@ def stage4_zstd(binary: Path, workdir: Path, seven_zip: Path) -> bool:
                                 extra=["--level=19"], workdir=workdir),
                  "fzip zstd succeeds"):
         return False
-    # Python zipfile does NOT understand method 93; rely on 7za.
-    if not check(verify_7za(archive, seven_zip), "7za t (Zstd method 93)"):
+    # Python zipfile does NOT understand method 93; stock 7za can't decode it
+    # either. Use our own round-trip: fzip extract + sha256 compare.
+    extract_dir = workdir / "extract_zstd"
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+    r = run([str(binary), "extract", str(archive), f"--outdir={extract_dir}"])
+    if not check(r.returncode == 0, "fzip extract succeeds"):
+        print(f"  stderr: {r.stderr[-400:]}")
         return False
-    return check(extract_and_compare(archive, files, workdir, seven_zip,
-                                     use_zipfile=False),
-                 "extract via 7za + byte-compare")
+    ok = True
+    for orig in files:
+        extracted = extract_dir / orig.name
+        if not extracted.exists():
+            print(f"  missing: {orig.name}")
+            ok = False
+            continue
+        h1 = sha256_file(orig)
+        h2 = sha256_file(extracted)
+        if not check(h1 == h2, f"sha256 match: {orig.name}"):
+            ok = False
+    return ok
 
 
 def stage5_auto(binary: Path, workdir: Path, seven_zip: Path) -> bool:

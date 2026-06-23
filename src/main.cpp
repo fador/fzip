@@ -13,6 +13,7 @@
 
 #include "codec.hpp"
 #include "io.hpp"
+#include "zip_reader.hpp"
 #include "zip_writer.hpp"
 
 namespace fzip {
@@ -157,6 +158,44 @@ auto cmd_auto(int argc, char** argv) -> int {
     return cmd_compress(CodecId::Deflate, 6, "auto", argc, argv);
 }
 
+auto cmd_extract(int argc, char** argv) -> int {
+    if (argc < 3) {
+        std::fprintf(stderr, "fzip extract: need <archive.zip> [--outdir=DIR]\n");
+        return 1;
+    }
+    std::string archive = argv[2];
+    std::string outdir = ".";
+    for (int i = 3; i < argc; ++i) {
+        std::string_view a = argv[i];
+        if (a.starts_with("--outdir=")) {
+            outdir = std::string(a.substr(9));
+        }
+    }
+    namespace fs = std::filesystem;
+    fs::create_directories(outdir);
+    auto entries = extract_all(archive);
+    for (const auto& [name, data] : entries) {
+        auto path = fs::path(outdir) / name;
+        // Create parent directories if the entry name contains '/'.
+        if (path.has_parent_path()) {
+            fs::create_directories(path.parent_path());
+        }
+        std::ofstream out(path, std::ios::binary);
+        if (!out) {
+            std::fprintf(stderr, "fzip extract: cannot write '%s'\n",
+                         path.string().c_str());
+            return 1;
+        }
+        if (!data.empty()) {
+            out.write(reinterpret_cast<const char*>(data.data()),
+                      static_cast<std::streamsize>(data.size()));
+        }
+    }
+    std::printf("fzip extract: extracted %zu file(s) from %s\n",
+                entries.size(), archive.c_str());
+    return 0;
+}
+
 }  // namespace
 
 auto run(int argc, char** argv) -> int {
@@ -185,6 +224,9 @@ auto run(int argc, char** argv) -> int {
     }
     if (cmd == "auto") {
         return cmd_auto(argc, argv);
+    }
+    if (cmd == "extract" || cmd == "x") {
+        return cmd_extract(argc, argv);
     }
 
     std::fprintf(stderr, "fzip: unknown command '%.*s'. Try 'fzip --help'.\n",

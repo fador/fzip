@@ -43,6 +43,7 @@ add_subdirectory(third_party/zstd/build/cmake EXCLUDE_FROM_ALL)
 add_executable(fzip
     src/main.cpp
     src/zip_writer.cpp
+    src/zip_reader.cpp
     src/crc32.cpp
     src/deflate.cpp
     src/zstd_codec.cpp
