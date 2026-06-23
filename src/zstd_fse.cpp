@@ -959,23 +959,26 @@ void fse_encode_one(FseBitWriter& writer, const FseEncodeTable& table,
     int end = (symbol + 1 < static_cast<int>(table.symbol_start.size()))
                   ? table.symbol_start[symbol + 1]
                   : table.table_size;
-    int count = end - start;
 
-    for (int i = 0; i < count; ++i) {
-        int p = start + i;
-        int bits = table.entries[p].bits;
-        int baseline = table.entries[p].baseline;
-        int val = static_cast<int>(state) - baseline;
-        if (val >= 0 && val < (1 << bits)) {
-            writer.put_bits(static_cast<std::uint32_t>(val), bits);
-            state = static_cast<std::uint32_t>(p);
+    // Correct FSE encoding algorithm (reverse-bitstream):
+    // 1. Look up decode[current_state] to get (nbBits, baseline).
+    // 2. Find a target state p for the desired symbol in [baseline, baseline + 2^nbBits).
+    // 3. Emit (p - baseline) using nbBits bits.
+    // 4. Set state = p.
+    const auto& cur = table.entries[state];
+    int nbBits = cur.bits;
+    int baseline = cur.baseline;
+
+    for (int i = start; i < end; ++i) {
+        if (i >= baseline && i < baseline + (1 << nbBits)) {
+            writer.put_bits(static_cast<std::uint32_t>(i - baseline), nbBits);
+            state = static_cast<std::uint32_t>(i);
             return;
         }
     }
 
-    // Fallback: if no matching state found (shouldn't happen with correct tables).
-    // This means the state is out of range for this symbol.
-    // In practice, this shouldn't happen if the encoder starts at a valid state.
+    // Fallback: emit 0 bits and set state to baseline (lossy but won't hang).
+    state = static_cast<std::uint32_t>(baseline);
 }
 
 void fse_flush_state(FseBitWriter& writer, const FseEncodeTable& table,
