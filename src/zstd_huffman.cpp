@@ -565,4 +565,174 @@ auto decode_huffman_stream(const HuffTable& table,
     return out;
 }
 
+// ==========================================================================
+// Huffman encoder implementation
+// ==========================================================================
+
+// Compute Huffman code lengths from frequencies.
+// Uses a simple heap-based Huffman tree construction with length limiting.
+auto compute_huff_lengths(const int* freqs, int num_symbols, int max_bits)
+    -> std::vector<int> {
+    std::vector<int> lengths(num_symbols, 0);
+
+    // Collect nonzero symbols.
+    struct Sym { int freq; int idx; };
+    std::vector<Sym> syms;
+    for (int s = 0; s < num_symbols; ++s) {
+        if (freqs[s] > 0) syms.push_back({freqs[s], s});
+    }
+    if (syms.empty()) return lengths;
+    if (syms.size() == 1) {
+        lengths[syms[0].idx] = 1;
+        return lengths;
+    }
+
+    // Build Huffman tree via priority queue.
+    struct Node { std::uint64_t freq; int parent; };
+    std::vector<Node> nodes;
+    nodes.reserve(syms.size() * 2);
+    for (auto& sp : syms) nodes.push_back({static_cast<std::uint64_t>(sp.freq), -1});
+
+    auto cmp = [&nodes](int a, int b) { return nodes[a].freq > nodes[b].freq; };
+    std::vector<int> heap;
+    for (int i = 0; i < static_cast<int>(syms.size()); ++i) heap.push_back(i);
+    std::make_heap(heap.begin(), heap.end(), cmp);
+
+    while (heap.size() > 1) {
+        std::pop_heap(heap.begin(), heap.end(), cmp);
+        int a = heap.back(); heap.pop_back();
+        std::pop_heap(heap.begin(), heap.end(), cmp);
+        int b = heap.back(); heap.pop_back();
+        int ni = static_cast<int>(nodes.size());
+        nodes.push_back({nodes[a].freq + nodes[b].freq, -1});
+        nodes[a].parent = ni;
+        nodes[b].parent = ni;
+        heap.push_back(ni);
+        std::push_heap(heap.begin(), heap.end(), cmp);
+    }
+
+    // Compute depths.
+    int max_depth = 0;
+    for (int i = 0; i < static_cast<int>(syms.size()); ++i) {
+        int d = 0;
+        int p = nodes[i].parent;
+        while (p != -1) { ++d; p = nodes[p].parent; }
+        lengths[syms[i].idx] = d;
+        if (d > max_depth) max_depth = d;
+    }
+
+    // Length-limit: if max_depth > max_bits, clamp and redistribute.
+    if (max_depth > max_bits) {
+        // Sort by frequency descending.
+        std::vector<int> order(syms.size());
+        for (int i = 0; i < static_cast<int>(syms.size()); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](int a, int b) { return syms[a].freq > syms[b].freq; });
+
+        // Assign all at max_bits, then try to shorten.
+        std::vector<int> newlen(num_symbols, 0);
+        for (int i = 0; i < static_cast<int>(syms.size()); ++i) {
+            newlen[syms[order[i]].idx] = max_bits;
+        }
+
+        // Greedy shortening: try to reduce lengths while Kraft holds.
+        bool improved = true;
+        while (improved) {
+            improved = false;
+            for (int oi = 0; oi < static_cast<int>(syms.size()); ++oi) {
+                int s = syms[order[oi]].idx;
+                if (newlen[s] <= 1) continue;
+                // Check Kraft sum.
+                double k = 0.0;
+                for (int i = 0; i < static_cast<int>(syms.size()); ++i) {
+                    k += 1.0 / (1u << newlen[syms[i].idx]);
+                }
+                double delta = 1.0 / (1u << (newlen[s] - 1));
+                if (k + delta <= 1.0 + 1e-12) {
+                    newlen[s]--;
+                    improved = true;
+                }
+            }
+        }
+        lengths = newlen;
+    }
+
+    return lengths;
+}
+
+auto build_huff_encode_table(const int* lengths, int max_symbol)
+    -> std::vector<HuffEncodeEntry> {
+    std::vector<HuffEncodeEntry> codes(max_symbol);
+
+    // Count codes per length.
+    std::array<int, kHuffmanMaxBits + 1> count{};
+    for (int s = 0; s < max_symbol; ++s) {
+        if (lengths[s] > 0 && lengths[s] <= kHuffmanMaxBits) {
+            count[lengths[s]]++;
+        }
+    }
+
+    // First code per length.
+    std::array<int, kHuffmanMaxBits + 1> first{};
+    int code = 0;
+    for (int bits = 1; bits <= kHuffmanMaxBits; ++bits) {
+        first[bits] = code;
+        code = (code + count[bits]) << 1;
+    }
+
+    // Assign codes.
+    for (int s = 0; s < max_symbol; ++s) {
+        int len = lengths[s];
+        if (len > 0 && len <= kHuffmanMaxBits) {
+            codes[s].code = static_cast<std::uint32_t>(first[len]++);
+            codes[s].bits = len;
+        } else {
+            codes[s].code = 0;
+            codes[s].bits = 0;
+        }
+    }
+
+    return codes;
+}
+
+void encode_huffman_stream(const std::vector<HuffEncodeEntry>& codes,
+                           const std::uint8_t* literals, int num_literals,
+                           std::vector<std::byte>& output) {
+    // Emit Huffman-coded literals as a forward bitstream (LSB-first).
+    // Each symbol's code is emitted LSB-first (matching zstd convention).
+    std::uint32_t acc = 0;
+    int acc_bits = 0;
+
+    auto flush_acc = [&]() {
+        while (acc_bits >= 8) {
+            output.push_back(static_cast<std::byte>(acc & 0xFFu));
+            acc >>= 8;
+            acc_bits -= 8;
+        }
+    };
+
+    for (int i = 0; i < num_literals; ++i) {
+        auto sym = literals[i];
+        if (sym >= codes.size() || codes[sym].bits == 0) continue;
+        // Emit code bits (LSB-first).
+        acc |= codes[sym].code << acc_bits;
+        acc_bits += codes[sym].bits;
+        flush_acc();
+    }
+
+    // Flush remaining bits.
+    if (acc_bits > 0) {
+        output.push_back(static_cast<std::byte>(acc & 0xFFu));
+    }
+}
+
+void write_huffman_weights_direct(const int* weights, int num_symbols,
+                                  std::vector<std::byte>& output) {
+    // Direct mode: header byte = num_symbols, followed by raw weight bytes.
+    output.push_back(static_cast<std::byte>(num_symbols));
+    for (int i = 0; i < num_symbols; ++i) {
+        output.push_back(static_cast<std::byte>(weights[i]));
+    }
+}
+
 }  // namespace fzip::zstd

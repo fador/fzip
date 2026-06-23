@@ -44,4 +44,30 @@ auto decode_huffman_stream(const HuffTable& table,
                            const std::byte* data, std::size_t size,
                            int num_literals) -> std::vector<std::byte>;
 
+// --- Encoder API ---
+
+// One Huffman code for encoding.
+struct HuffEncodeEntry {
+    std::uint32_t code;   // canonical code (LSB-first)
+    int           bits;   // code length in bits
+};
+
+// Build a Huffman encode table from code lengths.
+auto build_huff_encode_table(const int* lengths, int max_symbol)
+    -> std::vector<HuffEncodeEntry>;
+
+// Compute Huffman code lengths from symbol frequencies using the
+// package-merge algorithm approximation (length-limited to max_bits).
+auto compute_huff_lengths(const int* freqs, int num_symbols, int max_bits)
+    -> std::vector<int>;
+
+// Emit a Huffman-coded stream of literals to a forward bitstream.
+void encode_huffman_stream(const std::vector<HuffEncodeEntry>& codes,
+                           const std::uint8_t* literals, int num_literals,
+                           std::vector<std::byte>& output);
+
+// Write a Huffman weight table in direct mode (header byte + raw weights).
+void write_huffman_weights_direct(const int* weights, int num_symbols,
+                                  std::vector<std::byte>& output);
+
 }  // namespace fzip::zstd
