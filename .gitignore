@@ -1,0 +1,36 @@
+# Build outputs
+build/
+out/
+cmake-build-*/
+
+# IDE / editor
+.vs/
+.vscode/
+.cache/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.opendb
+*.VC.db
+
+# Corpus (downloaded by tests; large)
+corpus/silesia/
+corpus/enwik9/
+
+# Test artifacts
+*.zip
+*.zst
+*.7z
+test_tmp/
+verify_tmp/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
