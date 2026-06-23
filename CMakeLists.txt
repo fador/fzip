@@ -59,3 +59,7 @@ add_test(NAME stage0_smoke
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/verify.py
             --stage 0 --binary $<TARGET_FILE:fzip>
             --workdir ${CMAKE_BINARY_DIR}/test_tmp)
+add_test(NAME stage1_store
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/verify.py
+            --stage 1 --binary $<TARGET_FILE:fzip>
+            --workdir ${CMAKE_BINARY_DIR}/test_tmp)
