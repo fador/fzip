@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <span>
 #include <string>
 #include <string_view>
@@ -28,6 +29,9 @@ void print_usage() {
         "  fzip zstd <archive.zip> <files...> [--level=N]      (Stage 4)\n"
         "  fzip auto <archive.zip> <files...>                  (Stage 5)\n"
         "\n"
+        "A file argument beginning with '@' is treated as a list file: each\n"
+        "line is read as one file path (e.g. '@inputs.txt').\n"
+        "\n"
         "Stage 1 implements `store` (compression method 0).\n",
         kVersion);
 }
@@ -37,7 +41,6 @@ auto parse_level(int argc, char** argv, int default_level) -> int {
         std::string_view a = argv[i];
         if (a.starts_with("--level=")) {
             int v = 0;
-            // Manual parse to avoid <charconv> availability issues.
             bool ok = !a.substr(8).empty();
             for (char c : a.substr(8)) {
                 if (c < '0' || c > '9') { ok = false; break; }
@@ -49,16 +52,46 @@ auto parse_level(int argc, char** argv, int default_level) -> int {
     return default_level;
 }
 
+// Expand any '@listfile' arguments into their contents. Each line of the
+// list file is one path (blank lines and lines starting with '#' are
+// skipped). Returns the expanded list of file paths.
+auto expand_file_args(std::span<const std::string> args)
+    -> std::vector<std::string> {
+    std::vector<std::string> out;
+    for (const auto& a : args) {
+        if (!a.empty() && a[0] == '@') {
+            std::ifstream lf(a.substr(1));
+            if (!lf) {
+                throw std::runtime_error("cannot open list file: " + a);
+            }
+            std::string line;
+            while (std::getline(lf, line)) {
+                if (!line.empty() && line[0] != '#') {
+                    out.push_back(std::move(line));
+                }
+            }
+        } else {
+            out.push_back(a);
+        }
+    }
+    return out;
+}
+
 auto cmd_store(int argc, char** argv) -> int {
-    // argv[0]=store argv[1]=archive argv[2..]=files
+    // argv[0]=store argv[1]=archive argv[2..]=files / @listfiles
     if (argc < 3) {
         std::fprintf(stderr, "fzip store: need <archive.zip> <files...>\n");
         return 1;
     }
     std::string archive = argv[2];
-    std::vector<std::string> files;
+    std::vector<std::string> raw_args;
     for (int i = 3; i < argc; ++i) {
-        files.emplace_back(argv[i]);
+        raw_args.emplace_back(argv[i]);
+    }
+    auto files = expand_file_args(raw_args);
+    if (files.empty()) {
+        std::fprintf(stderr, "fzip store: no input files\n");
+        return 1;
     }
     if (!write_store_zip(archive, files)) {
         std::fprintf(stderr, "fzip store: failed to write '%s'\n", archive.c_str());

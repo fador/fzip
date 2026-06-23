@@ -63,3 +63,8 @@ add_test(NAME stage1_store
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/verify.py
             --stage 1 --binary $<TARGET_FILE:fzip>
             --workdir ${CMAKE_BINARY_DIR}/test_tmp)
+add_test(NAME stage2_zip64
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/verify.py
+            --stage 2 --binary $<TARGET_FILE:fzip>
+            --workdir ${CMAKE_BINARY_DIR}/test_tmp2)
+set_tests_properties(stage2_zip64 PROPERTIES TIMEOUT 300)

@@ -156,8 +156,16 @@ def make_small_files(workdir: Path, n: int, size: int = 32) -> list[Path]:
 
 
 def write_test_zip(binary: Path, archive: Path, files: list[Path],
-                   mode: str, extra: list[str] | None = None) -> bool:
-    cmd = [str(binary), mode, str(archive)] + [str(f) for f in files]
+                   mode: str, extra: list[str] | None = None,
+                   workdir: Path | None = None) -> bool:
+    # Use a list file ('@listfile') when there are many files, to avoid
+    # Windows' 32 KB command-line length limit.
+    if len(files) > 64 and workdir is not None:
+        list_file = workdir / "inputs.txt"
+        list_file.write_text("\n".join(str(f) for f in files))
+        cmd = [str(binary), mode, str(archive), f"@{list_file}"]
+    else:
+        cmd = [str(binary), mode, str(archive)] + [str(f) for f in files]
     if extra:
         cmd += extra
     r = run(cmd)
@@ -175,7 +183,7 @@ def stage1_store(binary: Path, workdir: Path, seven_zip: Path) -> bool:
     txt.write_text("Hello, fzip!\n" * 16)
     files.append(txt)
     archive = workdir / "stage1.zip"
-    if not check(write_test_zip(binary, archive, files, "store"),
+    if not check(write_test_zip(binary, archive, files, "store", workdir=workdir),
                  "fzip store succeeds"):
         return False
     if not check(verify_zipfile_crc(archive), "zipfile CRC test"):
@@ -189,18 +197,19 @@ def stage1_store(binary: Path, workdir: Path, seven_zip: Path) -> bool:
 
 def stage2_zip64(binary: Path, workdir: Path, seven_zip: Path) -> bool:
     print("[Stage 2] ZIP64 with >65535 entries")
-    # 70000 tiny entries triggers ZIP64 by entry count.
-    files = make_small_files(workdir, 70000, size=16)
+    # 65540 tiny entries triggers ZIP64 by entry count (threshold is 65535).
+    # Use 1-byte files to keep disk I/O and archive size small.
+    files = make_small_files(workdir, 65540, size=1)
     archive = workdir / "stage2.zip"
-    if not check(write_test_zip(binary, archive, files, "store"),
-                 "fzip store with 70000 entries succeeds"):
+    if not check(write_test_zip(binary, archive, files, "store", workdir=workdir),
+                 "fzip store with 65540 entries succeeds"):
         return False
     # Python zipfile supports ZIP64. Use it for CRC.
     if not check(verify_zipfile_crc(archive), "zipfile CRC test (ZIP64)"):
         return False
     if not check(verify_7za(archive, seven_zip), "7za t (ZIP64)"):
         return False
-    # Spot-check a few files instead of all 70000.
+    # Spot-check a few files instead of all 65540.
     sample = files[:8] + files[-8:]
     return check(extract_and_compare(archive, sample, workdir, seven_zip,
                                      use_zipfile=True),
@@ -216,7 +225,7 @@ def stage3_deflate(binary: Path, workdir: Path, seven_zip: Path) -> bool:
     files.append(txt)
     archive = workdir / "stage3.zip"
     if not check(write_test_zip(binary, archive, files, "deflate",
-                                extra=["--level=6"]),
+                                extra=["--level=6"], workdir=workdir),
                  "fzip deflate succeeds"):
         return False
     if not check(verify_zipfile_crc(archive), "zipfile CRC test (Deflate)"):
@@ -236,7 +245,7 @@ def stage4_zstd(binary: Path, workdir: Path, seven_zip: Path) -> bool:
     files.append(txt)
     archive = workdir / "stage4.zip"
     if not check(write_test_zip(binary, archive, files, "zstd",
-                                extra=["--level=19"]),
+                                extra=["--level=19"], workdir=workdir),
                  "fzip zstd succeeds"):
         return False
     # Python zipfile does NOT understand method 93; rely on 7za.
@@ -254,7 +263,8 @@ def stage5_auto(binary: Path, workdir: Path, seven_zip: Path) -> bool:
     txt.write_text("The quick brown fox jumps over the lazy dog.\n" * 256)
     files.append(txt)
     archive = workdir / "stage5.zip"
-    if not check(write_test_zip(binary, archive, files, "auto"),
+    if not check(write_test_zip(binary, archive, files, "auto",
+                                workdir=workdir),
                  "fzip auto succeeds"):
         return False
     if not check(verify_7za(archive, seven_zip), "7za t (auto)"):
