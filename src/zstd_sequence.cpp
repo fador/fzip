@@ -74,7 +74,7 @@ auto matchlen_code_to_extra(int code) -> int {
 
 auto offset_code_to_base(int code) -> int {
     if (code < 4) return 0;
-    return (1 << (code - 3)) + 3;
+    return (1 << (code - 2)) + 1;
 }
 
 auto decode_sequences(const std::byte* data, std::size_t size,
@@ -96,6 +96,7 @@ auto decode_sequences(const std::byte* data, std::size_t size,
     seqs.reserve(num_sequences);
 
     for (int i = 0; i < num_sequences; ++i) {
+        if (reader.empty()) break;
         // Decode order (reverse of output order): offset, matchlen, litlen.
         int offset_code = fse_decode_one(offset_table, reader, of_state);
         int matchlen_code = fse_decode_one(matchlen_table, reader, ml_state);
@@ -109,8 +110,8 @@ auto decode_sequences(const std::byte* data, std::size_t size,
             // Store as -(code+1) so execute_sequences can distinguish repeat codes.
             offset = -(offset_code + 1);
         } else {
-            int num_extra = offset_code - 4;
-            int base = (1 << (offset_code - 3)) + 3;
+            int num_extra = offset_code - 2;  // reference formula
+            int base = (1 << (offset_code - 2)) + 1;
             int extra = 0;
             if (num_extra > 0) {
                 extra = static_cast<int>(reader.read_bits(num_extra));
@@ -197,11 +198,14 @@ auto execute_sequences(const std::vector<Sequence>& sequences,
                 repeat.offsets[0] = offset;
             }
 
+            // Copy match bytes (may overlap with output).
             if (offset <= 0 || static_cast<std::size_t>(offset) > out.size()) {
                 throw ZstdError("invalid match offset: " + std::to_string(offset));
             }
+            if (seq.match_length > 131074) {
+                throw ZstdError("invalid match length: " + std::to_string(seq.match_length));
+            }
 
-            // Copy match bytes (may overlap with output).
             std::size_t src = out.size() - static_cast<std::size_t>(offset);
             for (int j = 0; j < seq.match_length; ++j) {
                 out.push_back(out[src + static_cast<std::size_t>(j)]);

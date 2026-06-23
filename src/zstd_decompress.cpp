@@ -76,7 +76,7 @@ auto parse_frame_header(const std::byte* data, std::size_t size,
     if (fcs_code == 0) {
         fcs_field_size = single_segment ? 1 : 0;
     } else {
-        fcs_field_size = 1 << (fcs_code + 1);
+        fcs_field_size = 1 << fcs_code;
     }
 
     hdr.single_segment = single_segment;

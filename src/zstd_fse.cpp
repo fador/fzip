@@ -56,35 +56,38 @@ void spread_symbols(std::uint8_t* table, int table_size,
 
 // Literal length codes: 36 symbols, accuracy log = 6.
 // Default distribution from the zstd spec.
+// -1 values filled: all 4 get 1 (remaining=4).
 constexpr int kPredefLitlenAccuracyLog = 6;
 constexpr int kPredefLitlenSymbols = 36;
 // clang-format off
 constexpr std::int8_t kPredefLitlenNorm[kPredefLitlenSymbols] = {
     4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
     2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
-    -1,-1,-1,-1
+    1, 1, 1, 1
 };
 // clang-format on
 
 // Match length codes: 53 symbols, accuracy log = 6.
+// -1 values filled: all 7 get 1 (remaining=7).
 constexpr int kPredefMatchlenAccuracyLog = 6;
 constexpr int kPredefMatchlenSymbols = 53;
 // clang-format off
 constexpr std::int8_t kPredefMatchlenNorm[kPredefMatchlenSymbols] = {
     1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,-1,-1,
-    -1,-1,-1,-1,-1
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1
 };
 // clang-format on
 
 // Offset codes: 32 symbols, accuracy log = 5.
+// -1 values filled: all 5 get 1 (remaining=5).
 constexpr int kPredefOffsetAccuracyLog = 5;
 constexpr int kPredefOffsetSymbols = 32;
 // clang-format off
 constexpr std::int8_t kPredefOffsetNorm[kPredefOffsetSymbols] = {
     1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1,-1,-1,-1,-1,-1
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0
 };
 // clang-format on
 
