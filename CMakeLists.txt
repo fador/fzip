@@ -39,6 +39,7 @@ add_executable(fzip
     src/zstd_compress.cpp
     src/zstd_fse.cpp
     src/zstd_huffman.cpp
+    src/zstd_sequence.cpp
     src/xxhash.cpp
     src/codec.cpp
     src/file_type.cpp)
