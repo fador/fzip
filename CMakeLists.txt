@@ -68,3 +68,8 @@ add_test(NAME stage2_zip64
             --stage 2 --binary $<TARGET_FILE:fzip>
             --workdir ${CMAKE_BINARY_DIR}/test_tmp2)
 set_tests_properties(stage2_zip64 PROPERTIES TIMEOUT 300)
+add_test(NAME stage3_deflate
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/verify.py
+            --stage 3 --binary $<TARGET_FILE:fzip>
+            --workdir ${CMAKE_BINARY_DIR}/test_tmp3)
+set_tests_properties(stage3_deflate PROPERTIES TIMEOUT 60)

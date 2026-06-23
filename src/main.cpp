@@ -1,5 +1,7 @@
 // fzip — state-of-the-art ZIP compressor in C++20.
 // Entry point. Wires up the CLI subcommands stage by stage.
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -10,6 +12,7 @@
 #include <vector>
 
 #include "codec.hpp"
+#include "io.hpp"
 #include "zip_writer.hpp"
 
 namespace fzip {
@@ -77,10 +80,35 @@ auto expand_file_args(std::span<const std::string> args)
     return out;
 }
 
-auto cmd_store(int argc, char** argv) -> int {
-    // argv[0]=store argv[1]=archive argv[2..]=files / @listfiles
+// Read files from disk into ZipEntry structs (shared by all subcommands).
+auto read_entries(const std::vector<std::string>& files)
+    -> std::vector<ZipEntry> {
+    namespace fs = std::filesystem;
+    std::vector<ZipEntry> entries;
+    entries.reserve(files.size());
+    for (const auto& path : files) {
+        fs::path p(path);
+        ZipEntry e;
+        e.name = p.filename().string();
+        e.data = io::read_file(path);
+        auto ftime = fs::last_write_time(p);
+        auto sctime = std::chrono::time_point_cast<std::chrono::seconds>(ftime);
+        auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+            sctime.time_since_epoch());
+        e.mtime_unix = static_cast<std::uint64_t>(secs.count());
+        auto [dos_t, dos_d] = dos_time_date(e.mtime_unix);
+        e.mod_time = dos_t;
+        e.mod_date = dos_d;
+        entries.push_back(std::move(e));
+    }
+    return entries;
+}
+
+auto cmd_compress(CodecId codec, int default_level, std::string_view mode_name,
+                  int argc, char** argv) -> int {
     if (argc < 3) {
-        std::fprintf(stderr, "fzip store: need <archive.zip> <files...>\n");
+        std::fprintf(stderr, "fzip %.*s: need <archive.zip> <files...>\n",
+                     static_cast<int>(mode_name.size()), mode_name.data());
         return 1;
     }
     std::string archive = argv[2];
@@ -89,17 +117,44 @@ auto cmd_store(int argc, char** argv) -> int {
         raw_args.emplace_back(argv[i]);
     }
     auto files = expand_file_args(raw_args);
+    // Drop any command-line option flags (--level=..., etc.) from the file list.
+    std::erase_if(files, [](const std::string& s) {
+        return s.starts_with("--");
+    });
     if (files.empty()) {
-        std::fprintf(stderr, "fzip store: no input files\n");
+        std::fprintf(stderr, "fzip %.*s: no input files\n",
+                     static_cast<int>(mode_name.size()), mode_name.data());
         return 1;
     }
-    if (!write_store_zip(archive, files)) {
-        std::fprintf(stderr, "fzip store: failed to write '%s'\n", archive.c_str());
+    int level = parse_level(argc, argv, default_level);
+    auto entries = read_entries(files);
+    if (!write_zip(archive, entries, codec, level)) {
+        std::fprintf(stderr, "fzip %.*s: failed to write '%s'\n",
+                     static_cast<int>(mode_name.size()), mode_name.data(),
+                     archive.c_str());
         return 1;
     }
-    std::printf("fzip store: wrote %s with %zu file(s)\n",
+    std::printf("fzip %.*s: wrote %s with %zu file(s)\n",
+                static_cast<int>(mode_name.size()), mode_name.data(),
                 archive.c_str(), files.size());
     return 0;
+}
+
+auto cmd_store(int argc, char** argv) -> int {
+    return cmd_compress(CodecId::Store, 0, "store", argc, argv);
+}
+
+auto cmd_deflate(int argc, char** argv) -> int {
+    return cmd_compress(CodecId::Deflate, 6, "deflate", argc, argv);
+}
+
+auto cmd_zstd(int argc, char** argv) -> int {
+    return cmd_compress(CodecId::Zstd, 19, "zstd", argc, argv);
+}
+
+auto cmd_auto(int argc, char** argv) -> int {
+    // Stage 5 will replace this with real auto-selection. For now, deflate.
+    return cmd_compress(CodecId::Deflate, 6, "auto", argc, argv);
 }
 
 }  // namespace
@@ -121,6 +176,15 @@ auto run(int argc, char** argv) -> int {
     }
     if (cmd == "store") {
         return cmd_store(argc, argv);
+    }
+    if (cmd == "deflate") {
+        return cmd_deflate(argc, argv);
+    }
+    if (cmd == "zstd") {
+        return cmd_zstd(argc, argv);
+    }
+    if (cmd == "auto") {
+        return cmd_auto(argc, argv);
     }
 
     std::fprintf(stderr, "fzip: unknown command '%.*s'. Try 'fzip --help'.\n",
