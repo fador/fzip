@@ -154,8 +154,31 @@ auto cmd_zstd(int argc, char** argv) -> int {
 }
 
 auto cmd_auto(int argc, char** argv) -> int {
-    // Stage 5 will replace this with real auto-selection. For now, deflate.
-    return cmd_compress(CodecId::Deflate, 6, "auto", argc, argv);
+    if (argc < 3) {
+        std::fprintf(stderr, "fzip auto: need <archive.zip> <files...>\n");
+        return 1;
+    }
+    std::string archive = argv[2];
+    std::vector<std::string> raw_args;
+    for (int i = 3; i < argc; ++i) {
+        raw_args.emplace_back(argv[i]);
+    }
+    auto files = expand_file_args(raw_args);
+    std::erase_if(files, [](const std::string& s) {
+        return s.starts_with("--");
+    });
+    if (files.empty()) {
+        std::fprintf(stderr, "fzip auto: no input files\n");
+        return 1;
+    }
+    auto entries = read_entries(files);
+    if (!write_zip_auto(archive, entries)) {
+        std::fprintf(stderr, "fzip auto: failed to write '%s'\n", archive.c_str());
+        return 1;
+    }
+    std::printf("fzip auto: wrote %s with %zu file(s)\n",
+                archive.c_str(), files.size());
+    return 0;
 }
 
 auto cmd_extract(int argc, char** argv) -> int {

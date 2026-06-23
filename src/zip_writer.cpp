@@ -439,4 +439,67 @@ auto write_store_zip(const std::string& archive_path,
     return write_zip(archive_path, entries, CodecId::Store, 0);
 }
 
+auto write_zip_auto(const std::string& archive_path,
+                    const std::vector<ZipEntry>& entries) -> bool {
+    std::ofstream out(archive_path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+
+    std::vector<EntryRecord> records;
+    records.reserve(entries.size());
+
+    std::uint64_t offset = 0;
+
+    for (const auto& entry : entries) {
+        EntryRecord r;
+        r.name = entry.name;
+        r.mod_time = entry.mod_time;
+        r.mod_date = entry.mod_date;
+        r.flags = kFlagUtf8;
+        r.uncompressed_size = entry.data.size();
+        r.crc32 = crc32(std::span<const std::byte>{entry.data});
+        r.mtime_unix = entry.mtime_unix;
+        r.atime_unix = entry.mtime_unix;
+        r.ctime_unix = entry.mtime_unix;
+        r.uid = 0;
+        r.gid = 0;
+
+        CompressedEntry ce = compress_auto(
+            std::span<const std::byte>{entry.data}, entry.name);
+        r.method = static_cast<std::uint16_t>(ce.codec);
+        r.compressed_size = ce.data.size();
+        r.zip64_entry = needs_zip64_size(r.uncompressed_size, r.compressed_size);
+
+        auto local_extra = build_local_extra(r, /*include_ut_unix=*/true);
+
+        const std::uint64_t header_size = 30 + r.name.size() + local_extra.size();
+        const bool align = r.uncompressed_size >= kDataAlignment;
+        std::uint64_t data_start = offset + header_size;
+        if (align && data_start % kDataAlignment != 0) {
+            std::uint64_t pad = kDataAlignment - (data_start % kDataAlignment);
+            std::string zeros(pad, '\0');
+            out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+            offset += pad;
+        }
+
+        r.local_header_offset = offset;
+        write_local_header(out, r, local_extra);
+        io::write_bytes(out, std::span<const std::byte>{ce.data});
+
+        offset = r.local_header_offset + header_size + r.compressed_size;
+        records.push_back(std::move(r));
+    }
+
+    std::uint64_t cd_offset = offset;
+    for (const auto& r : records) {
+        auto central_extra = build_central_extra(r, /*include_ut_unix=*/true);
+        write_central_header(out, r, central_extra);
+    }
+    std::uint64_t cd_end = static_cast<std::uint64_t>(out.tellp());
+    std::uint64_t cd_size = cd_end - cd_offset;
+
+    write_eocd(out, cd_size, cd_offset, records.size());
+    out.flush();
+    return static_cast<bool>(out);
+}
+
 }  // namespace fzip

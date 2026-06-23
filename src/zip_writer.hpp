@@ -39,6 +39,11 @@ auto write_zip(const std::string& archive_path,
                CodecId codec = CodecId::Store,
                int level = 6) -> bool;
 
+// Write a ZIP archive with per-entry auto codec selection (type detection).
+// Each entry is compressed with the best codec for its content type.
+auto write_zip_auto(const std::string& archive_path,
+                    const std::vector<ZipEntry>& entries) -> bool;
+
 // Convenience: read each file from disk and store it (method 0).
 // Filenames in the archive are the basenames of the input paths.
 auto write_store_zip(const std::string& archive_path,

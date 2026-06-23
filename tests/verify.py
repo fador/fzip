@@ -282,11 +282,27 @@ def stage5_auto(binary: Path, workdir: Path, seven_zip: Path) -> bool:
                                 workdir=workdir),
                  "fzip auto succeeds"):
         return False
-    if not check(verify_7za(archive, seven_zip), "7za t (auto)"):
+    # Use fzip extract for round-trip (auto may select zstd which 7za can't
+    # decode).
+    extract_dir = workdir / "extract_auto"
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir)
+    r = run([str(binary), "extract", str(archive), f"--outdir={extract_dir}"])
+    if not check(r.returncode == 0, "fzip extract succeeds"):
+        print(f"  stderr: {r.stderr[-400:]}")
         return False
-    return check(extract_and_compare(archive, files, workdir, seven_zip,
-                                     use_zipfile=False),
-                 "extract via 7za + byte-compare")
+    ok = True
+    for orig in files:
+        extracted = extract_dir / orig.name
+        if not extracted.exists():
+            print(f"  missing: {orig.name}")
+            ok = False
+            continue
+        h1 = sha256_file(orig)
+        h2 = sha256_file(extracted)
+        if not check(h1 == h2, f"sha256 match: {orig.name}"):
+            ok = False
+    return ok
 
 
 STAGES = {

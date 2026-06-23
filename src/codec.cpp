@@ -5,18 +5,16 @@
 #include <stdexcept>
 
 #include "deflate.hpp"
+#include "file_type.hpp"
 #include "zstd_codec.hpp"
 
 namespace fzip {
 
 namespace {
 
-// Compress with a specific codec, falling back to Store if compression
-// doesn't shrink the input or if the codec returns empty.
 auto compress_with(CodecId codec, std::span<const std::byte> data,
                    int level, [[maybe_unused]] std::string_view hint_path) -> CompressedEntry {
     if (data.empty()) {
-        // Empty input: Store is fine (zero-length entry).
         CompressedEntry e;
         e.codec = CodecId::Store;
         return e;
@@ -31,7 +29,6 @@ auto compress_with(CodecId codec, std::span<const std::byte> data,
         case CodecId::Deflate: {
             auto out = deflate_compress(data, level);
             if (out.empty()) {
-                // Compression didn't help; fall back to Store.
                 CompressedEntry e;
                 e.codec = CodecId::Store;
                 e.data.assign(data.begin(), data.end());
@@ -67,9 +64,28 @@ auto compress(CodecId codec, std::span<const std::byte> data, int level,
 }
 
 auto compress_auto(std::span<const std::byte> data,
-                   std::string_view /*hint_path*/) -> CompressedEntry {
-    // Stage 5 will add type detection. For now, default to Deflate.
-    return compress_with(CodecId::Deflate, data, 6, "");
+                   std::string_view hint_path) -> CompressedEntry {
+    auto ftype = detect_file_type(hint_path, data);
+
+    switch (ftype) {
+        case FileType::Incompressible:
+            // Already compressed — Store.
+            return compress_with(CodecId::Store, data, 0, hint_path);
+
+        case FileType::Executable:
+            // Executables: zstd-19 (good ratio, fast decode).
+            return compress_with(CodecId::Zstd, data, 19, hint_path);
+
+        case FileType::Text:
+            // Text/XML/JSON/source: zstd-22 with long-distance matching
+            // for maximum ratio on repetitive text.
+            return compress_with(CodecId::Zstd, data, 22, hint_path);
+
+        case FileType::Binary:
+        default:
+            // General binary: deflate-6 (good universal default).
+            return compress_with(CodecId::Deflate, data, 6, hint_path);
+    }
 }
 
 auto decompress(const CompressedEntry& entry) -> std::vector<std::byte> {
