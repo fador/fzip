@@ -418,22 +418,21 @@ auto compress(std::span<const std::byte> data, int level,
 
     std::size_t size = data.size();
 
-    // Build frame with a single raw block (type 0).
-    // This is the simplest valid zstd output — no compression, but the
-    // format is correct and the decompressor can handle it.
-    // FSE-based compressed blocks will be added in a later iteration.
+    // Build frame with raw blocks (type 0).
+    // The FSE-based compressed block encoder is implemented but the
+    // reverse-bitstream FSE encoding produces incorrect output for
+    // sequences. Using raw blocks ensures correct round-trip.
+    // TODO: fix FSE encoding for compressed blocks.
     std::vector<std::byte> output;
 
-    // Frame header: magic + descriptor.
     std::uint32_t magic = 0xFD2FB528u;
     output.insert(output.end(), reinterpret_cast<std::byte*>(&magic),
                   reinterpret_cast<std::byte*>(&magic) + 4);
 
-    // Determine FCS field size.
     int fcs_size;
     std::uint8_t fcs_code;
     if (size < 256) {
-        fcs_code = 0; fcs_size = 1;  // single_segment mode
+        fcs_code = 0; fcs_size = 1;
     } else if (size < 65536) {
         fcs_code = 1; fcs_size = 2;
     } else if (size < (1ULL << 32)) {
@@ -441,28 +440,17 @@ auto compress(std::span<const std::byte> data, int level,
     } else {
         fcs_code = 3; fcs_size = 8;
     }
-
-    // Descriptor: checksum=1 (bit 2), single_segment=(fcs_code==0 ? 1 : 0),
-    // FCS code in bits 6-7.
     bool single_seg = (fcs_code == 0);
     std::uint8_t desc = static_cast<std::uint8_t>(
         (1 << 2) | (single_seg ? (1 << 5) : 0) | (fcs_code << 6));
     output.push_back(static_cast<std::byte>(desc));
-
-    // Window descriptor (only if !single_segment).
     if (!single_seg) {
-        // 32 KB window: window_log=15, wd = (15-10)<<3 + 0 = 40.
         output.push_back(static_cast<std::byte>(40));
     }
-
-    // Frame content size.
     for (int i = 0; i < fcs_size; ++i) {
         output.push_back(static_cast<std::byte>((size >> (8 * i)) & 0xFF));
     }
 
-    // Block header: last_block=1, type=0 (raw), block_size = size.
-    // Raw block size limited to 128 KB (min of window_size, 128KB).
-    // For larger inputs, emit multiple raw blocks.
     const std::byte* p = data.data();
     std::size_t remaining = size;
     while (remaining > 0) {
@@ -470,25 +458,20 @@ auto compress(std::span<const std::byte> data, int level,
             std::min(remaining, std::size_t{128 * 1024}));
         bool last = (remaining <= 128 * 1024);
         remaining -= blk_sz;
-
         std::uint32_t blk_hdr = (last ? 1u : 0u) | (0u << 1) | (blk_sz << 3);
         output.push_back(static_cast<std::byte>(blk_hdr & 0xFF));
         output.push_back(static_cast<std::byte>((blk_hdr >> 8) & 0xFF));
         output.push_back(static_cast<std::byte>((blk_hdr >> 16) & 0xFF));
-
         output.insert(output.end(), p, p + blk_sz);
         p += blk_sz;
     }
 
-    // Content checksum (xxHash-64 low 32 bits).
     std::uint64_t checksum = xxhash64(data);
     std::uint32_t cs = static_cast<std::uint32_t>(checksum);
     output.insert(output.end(), reinterpret_cast<std::byte*>(&cs),
                   reinterpret_cast<std::byte*>(&cs) + 4);
 
-    // If the raw output is larger than the input, signal Store fallback.
     if (output.size() >= size) return {};
-
     return output;
 }
 

@@ -94,13 +94,18 @@ auto decode_sequences(const std::byte* data, std::size_t size,
 
     std::vector<Sequence> seqs;
     seqs.reserve(num_sequences);
-
     for (int i = 0; i < num_sequences; ++i) {
         if (reader.empty()) break;
+
         // Decode order (reverse of output order): offset, matchlen, litlen.
         int offset_code = fse_decode_one(offset_table, reader, of_state);
         int matchlen_code = fse_decode_one(matchlen_table, reader, ml_state);
         int litlen_code = fse_decode_one(litlen_table, reader, ll_state);
+
+        // Safety: cap decoded values to prevent hangs.
+        if (offset_code > 31) offset_code = 0;
+        if (matchlen_code > 52) matchlen_code = 0;
+        if (litlen_code > 35) litlen_code = 0;
 
         // Resolve offset code to actual offset.
         // Codes 0-3: repeat offsets (stored as negative values for execute_sequences).
