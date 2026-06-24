@@ -766,6 +766,16 @@ auto build_fse_encode_table(int accuracy_log, const int* norm_counts,
     return table;
 }
 
+// Reverse the low `n` bits of `v`. E.g. reverse_bits(0b101, 3) = 0b101;
+// reverse_bits(0b011, 3) = 0b110.
+auto reverse_bits(std::uint32_t v, int n) -> std::uint32_t {
+    std::uint32_t r = 0;
+    for (int i = 0; i < n; ++i) {
+        r = (r << 1) | ((v >> i) & 1u);
+    }
+    return r;
+}
+
 void fse_encode_one(FseBitWriter& writer, const FseEncodeTable& table,
                     std::uint32_t& state, std::uint8_t symbol) {
     int T = table.table_size;
@@ -776,7 +786,10 @@ void fse_encode_one(FseBitWriter& writer, const FseEncodeTable& table,
         int val = static_cast<int>(state) - baseline;
         if (val < 0) val += T;
         if (val < (1 << bits)) {
-            writer.put_bits(static_cast<std::uint32_t>(val), bits);
+            // The decoder reads bits from the end backward (MSB-first within
+            // each byte group). To ensure the decoder reads back `val`,
+            // we must emit the bit-reverse of `val`.
+            writer.put_bits(reverse_bits(static_cast<std::uint32_t>(val), bits), bits);
             state = static_cast<std::uint32_t>(p);
             return;
         }
@@ -785,7 +798,7 @@ void fse_encode_one(FseBitWriter& writer, const FseEncodeTable& table,
 
 void fse_flush_state(FseBitWriter& writer, const FseEncodeTable& table,
                      std::uint32_t state) {
-    writer.put_bits(state, table.accuracy_log);
+    writer.put_bits(reverse_bits(state, table.accuracy_log), table.accuracy_log);
 }
 
 void write_fse_table_description(FseBitWriter& writer, int accuracy_log,

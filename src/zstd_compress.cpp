@@ -16,6 +16,15 @@ namespace fzip::zstd {
 
 namespace {
 
+// Reverse the low `n` bits of `v`.
+auto reverse_bits(std::uint32_t v, int n) -> std::uint32_t {
+    std::uint32_t r = 0;
+    for (int i = 0; i < n; ++i) {
+        r = (r << 1) | ((v >> i) & 1u);
+    }
+    return r;
+}
+
 // --- LZ77 match finder (3-byte hash, hash-chain, greedy) ---
 constexpr int kHashBits = 16;
 constexpr int kHashSize = 1 << kHashBits;
@@ -277,18 +286,20 @@ void emit_sequences_section(std::vector<std::byte>& output,
                        static_cast<std::uint8_t>(ll_code));
 
         // Extra bits: litlen, matchlen, offset.
+        // All bits written to the FSE bitstream must be reversed because
+        // the decoder reads backward (MSB-first from the end).
         int ll_extra = litlen_code_to_extra(ll_code);
         if (ll_extra > 0) {
             int ll_base = litlen_code_to_base(ll_code);
             fse_writer.put_bits(
-                static_cast<std::uint32_t>(seq.literals_length - ll_base), ll_extra);
+                reverse_bits(static_cast<std::uint32_t>(seq.literals_length - ll_base), ll_extra), ll_extra);
         }
 
         int ml_extra = matchlen_code_to_extra(ml_code);
         if (ml_extra > 0) {
             int ml_base = matchlen_code_to_base(ml_code);
             fse_writer.put_bits(
-                static_cast<std::uint32_t>(seq.match_length - ml_base), ml_extra);
+                reverse_bits(static_cast<std::uint32_t>(seq.match_length - ml_base), ml_extra), ml_extra);
         }
 
         if (of_code >= 4) {
@@ -296,7 +307,7 @@ void emit_sequences_section(std::vector<std::byte>& output,
             int of_base = (1 << (of_code - 2)) + 1;
             if (of_extra > 0) {
                 fse_writer.put_bits(
-                    static_cast<std::uint32_t>(seq.offset - of_base), of_extra);
+                    reverse_bits(static_cast<std::uint32_t>(seq.offset - of_base), of_extra), of_extra);
             }
         }
     }
