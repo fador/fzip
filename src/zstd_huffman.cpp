@@ -68,8 +68,8 @@ auto build_huff_table(const int* lengths, int max_symbol) -> HuffTable {
     auto codes = compute_canonical_codes(lengths, max_symbol);
 
     HuffTable table;
-    // Use a table of 9 bits for direct lookup (good balance of memory/speed).
-    table.table_bits = 9;
+    // Use a table of 12 bits for direct lookup (covers all zstd Huffman codes).
+    table.table_bits = 12;
     table.table_size = 1 << table.table_bits;
     table.entries.resize(table.table_size);
 
@@ -102,7 +102,7 @@ auto build_huff_table(const int* lengths, int max_symbol) -> HuffTable {
 // --------------------------------------------------------------------------
 auto huff_decode_one(const HuffTable& table, const std::byte* data,
                      std::size_t size, std::size_t& bit_pos) -> std::uint8_t {
-    // Read table_bits bits from the stream (LSB-first).
+    // Read table_bits bits from the stream (LSB-first) and do direct lookup.
     std::uint32_t bits = 0;
     for (int i = 0; i < table.table_bits; ++i) {
         std::size_t bp = bit_pos + i;
@@ -113,22 +113,9 @@ auto huff_decode_one(const HuffTable& table, const std::byte* data,
     }
 
     const auto& entry = table.entries[bits];
-    if (entry.bits > 0 && entry.bits <= table.table_bits) {
-        // Short code: direct lookup.
-        bit_pos += entry.bits;
-        return entry.symbol;
-    }
-
-    // Long code (> table_bits): need to read more bits and do a linear
-    // search among the long codes. This is slow but rare.
-    // For simplicity, re-read the full code from the bitstream.
-    auto codes = compute_canonical_codes(nullptr, 0);  // won't work, need a fallback
-
-    // Actually, for long codes we need the full code lengths to recompute.
-    // Let's use a simpler approach: store the code lengths in the table
-    // and do a sequential scan for long codes.
-    // For now, this path shouldn't be hit with table_bits=9 and max 12-bit codes.
-    throw ZstdError("huffman long code not implemented");
+    if (entry.bits == 0) throw ZstdError("huffman decode: unmapped code");
+    bit_pos += entry.bits;
+    return entry.symbol;
 }
 
 // --------------------------------------------------------------------------
@@ -728,9 +715,20 @@ void encode_huffman_stream(const std::vector<HuffEncodeEntry>& codes,
 
 void write_huffman_weights_direct(const int* weights, int num_symbols,
                                   std::vector<std::byte>& output) {
-    // Direct mode: header byte = num_symbols, followed by raw weight bytes.
-    output.push_back(static_cast<std::byte>(num_symbols));
+    // Find the highest symbol with non-zero weight.
+    int max_sym = 0;
     for (int i = 0; i < num_symbols; ++i) {
+        if (weights[i] > 0) max_sym = i + 1;
+    }
+    if (max_sym == 0) max_sym = 1;  // at least 1 symbol
+
+    // Direct mode: header byte = number of symbols (must be < 128).
+    // If max_sym > 127, we need FSE-compressed weights (not yet implemented).
+    // Cap at 127 for direct mode.
+    if (max_sym > 127) max_sym = 127;
+
+    output.push_back(static_cast<std::byte>(max_sym));
+    for (int i = 0; i < max_sym; ++i) {
         output.push_back(static_cast<std::byte>(weights[i]));
     }
 }

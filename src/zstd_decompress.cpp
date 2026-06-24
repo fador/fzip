@@ -668,6 +668,10 @@ auto decompress_compressed_block(const std::byte* data, std::size_t size,
 
     // Read number of sequences.
     std::size_t num_seq_consumed = 0;
+    if (p >= end) {
+        // No room for sequences — treat as 0 sequences.
+        return literals;
+    }
     int num_sequences = read_num_sequences(p, end, num_seq_consumed);
     p += num_seq_consumed;
 

@@ -277,22 +277,26 @@ void emit_sequences_section(std::vector<std::byte>& output,
         int of_code = (seq.offset <= 3) ? seq.offset : distance_to_offset_code(seq.offset);
         int ml_code = match_length_to_code(seq.match_length);
 
-        // FSE symbols: offset, matchlen, litlen.
-        fse_encode_one(fse_writer, of_etable, of_state,
-                       static_cast<std::uint8_t>(of_code));
-        fse_encode_one(fse_writer, ml_etable, ml_state,
-                       static_cast<std::uint8_t>(ml_code));
+        // FSE symbols: write in REVERSE order (LL, ML, OF) so the backward
+        // reader encounters OF first, then ML, then LL — matching the
+        // decoder's read order.
         fse_encode_one(fse_writer, ll_etable, ll_state,
                        static_cast<std::uint8_t>(ll_code));
+        fse_encode_one(fse_writer, ml_etable, ml_state,
+                       static_cast<std::uint8_t>(ml_code));
+        fse_encode_one(fse_writer, of_etable, of_state,
+                       static_cast<std::uint8_t>(of_code));
 
-        // Extra bits: litlen, matchlen, offset.
-        // All bits written to the FSE bitstream must be reversed because
-        // the decoder reads backward (MSB-first from the end).
-        int ll_extra = litlen_code_to_extra(ll_code);
-        if (ll_extra > 0) {
-            int ll_base = litlen_code_to_base(ll_code);
-            fse_writer.put_bits(
-                reverse_bits(static_cast<std::uint32_t>(seq.literals_length - ll_base), ll_extra), ll_extra);
+        // Extra bits: write in order OF, ML, LL so the backward reader
+        // encounters LL extra first, then ML extra, then OF extra — matching
+        // the decoder's read order (LL extra, ML extra, OF extra).
+        if (of_code >= 4) {
+            int of_extra = of_code - 2;
+            int of_base = (1 << (of_code - 2)) + 1;
+            if (of_extra > 0) {
+                fse_writer.put_bits(
+                    reverse_bits(static_cast<std::uint32_t>(seq.offset - of_base), of_extra), of_extra);
+            }
         }
 
         int ml_extra = matchlen_code_to_extra(ml_code);
@@ -302,13 +306,11 @@ void emit_sequences_section(std::vector<std::byte>& output,
                 reverse_bits(static_cast<std::uint32_t>(seq.match_length - ml_base), ml_extra), ml_extra);
         }
 
-        if (of_code >= 4) {
-            int of_extra = of_code - 2;
-            int of_base = (1 << (of_code - 2)) + 1;
-            if (of_extra > 0) {
-                fse_writer.put_bits(
-                    reverse_bits(static_cast<std::uint32_t>(seq.offset - of_base), of_extra), of_extra);
-            }
+        int ll_extra = litlen_code_to_extra(ll_code);
+        if (ll_extra > 0) {
+            int ll_base = litlen_code_to_base(ll_code);
+            fse_writer.put_bits(
+                reverse_bits(static_cast<std::uint32_t>(seq.literals_length - ll_base), ll_extra), ll_extra);
         }
     }
 
@@ -338,9 +340,9 @@ auto compress(std::span<const std::byte> data, int level,
     std::size_t size = data.size();
 
     // Raw-block compressor (type 0). The FSE-based compressed block encoder
-    // is implemented but the reverse-bitstream FSE encoding has unresolved
-    // issues with sentinel positioning and bit ordering. Using raw blocks
-    // ensures correct round-trip.
+    // is implemented but the reverse-bitstream FSE encoding produces
+    // incorrect output for sequences — the encode/decode round-trip fails
+    // on non-trivial inputs. Using raw blocks ensures correct round-trip.
     // TODO: fix FSE encoding for compressed blocks.
     std::vector<std::byte> output;
 
