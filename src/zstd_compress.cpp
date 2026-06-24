@@ -277,19 +277,11 @@ void emit_sequences_section(std::vector<std::byte>& output,
         int of_code = (seq.offset <= 3) ? seq.offset : distance_to_offset_code(seq.offset);
         int ml_code = match_length_to_code(seq.match_length);
 
-        // FSE symbols: write in REVERSE order (LL, ML, OF) so the backward
-        // reader encounters OF first, then ML, then LL — matching the
-        // decoder's read order.
-        fse_encode_one(fse_writer, ll_etable, ll_state,
-                       static_cast<std::uint8_t>(ll_code));
-        fse_encode_one(fse_writer, ml_etable, ml_state,
-                       static_cast<std::uint8_t>(ml_code));
-        fse_encode_one(fse_writer, of_etable, of_state,
-                       static_cast<std::uint8_t>(of_code));
+        // Decoder reads (from backward stream): OF FSE, ML FSE, LL FSE,
+        // LL extra, ML extra, OF extra. So forward write order must be:
+        // OF extra, ML extra, LL extra, LL FSE, ML FSE, OF FSE.
 
-        // Extra bits: write in order OF, ML, LL so the backward reader
-        // encounters LL extra first, then ML extra, then OF extra — matching
-        // the decoder's read order (LL extra, ML extra, OF extra).
+        // OF extra bits (read last by decoder → written first).
         if (of_code >= 4) {
             int of_extra = of_code - 2;
             int of_base = (1 << (of_code - 2)) + 1;
@@ -299,6 +291,7 @@ void emit_sequences_section(std::vector<std::byte>& output,
             }
         }
 
+        // ML extra bits.
         int ml_extra = matchlen_code_to_extra(ml_code);
         if (ml_extra > 0) {
             int ml_base = matchlen_code_to_base(ml_code);
@@ -306,12 +299,21 @@ void emit_sequences_section(std::vector<std::byte>& output,
                 reverse_bits(static_cast<std::uint32_t>(seq.match_length - ml_base), ml_extra), ml_extra);
         }
 
+        // LL extra bits.
         int ll_extra = litlen_code_to_extra(ll_code);
         if (ll_extra > 0) {
             int ll_base = litlen_code_to_base(ll_code);
             fse_writer.put_bits(
                 reverse_bits(static_cast<std::uint32_t>(seq.literals_length - ll_base), ll_extra), ll_extra);
         }
+
+        // FSE symbols: LL, ML, OF (read by decoder as OF, ML, LL).
+        fse_encode_one(fse_writer, ll_etable, ll_state,
+                       static_cast<std::uint8_t>(ll_code));
+        fse_encode_one(fse_writer, ml_etable, ml_state,
+                       static_cast<std::uint8_t>(ml_code));
+        fse_encode_one(fse_writer, of_etable, of_state,
+                       static_cast<std::uint8_t>(of_code));
     }
 
     // Flush states: OF(5), ML(6), LL(6).
