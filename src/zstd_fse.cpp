@@ -150,19 +150,49 @@ auto build_fse_table(int accuracy_log, const int* norm_counts, int max_symbol)
 // --------------------------------------------------------------------------
 FseBitReader::FseBitReader(const std::byte* data, std::size_t size)
     : data_(data), size_(size), pos_(0) {
-    // The FSE bitstream is written forward (LSB first), then read backward.
-    // The last byte written contains a 1-bit sentinel followed by zero padding.
-    // We start reading from the last byte, backward.
+    // The FSE bitstream is written forward (LSB-first into bytes).
+    // The decoder reads it BACKWARD: bytes from end to start, and within
+    // each byte, bits from MSB to LSB. This is the reverse of writing.
+    //
+    // The sentinel is a 1-bit written just before the byte-align. When
+    // reading backward, the first 1-bit encountered is the sentinel.
+    // We skip past it by setting pos_ to the bit position just below it.
+    //
+    // Reading order: start at last byte, read bit 7 (MSB), bit 6, ..., bit 0.
+    // Then move to previous byte, read bit 7, bit 6, ..., bit 0.
+    // pos_ counts bits consumed from the end (going backward).
+    if (size > 0) {
+        // Find the sentinel: scan backward from the last byte.
+        // Within each byte, scan from MSB (bit 7) to LSB (bit 0).
+        for (std::size_t bi = 0; bi < size; ++bi) {
+            auto byte = static_cast<std::uint8_t>(data[size - 1 - bi]);
+            if (byte == 0) continue;
+            // Find the highest 1-bit in this byte (MSB-first reading).
+            for (int bit = 7; bit >= 0; --bit) {
+                if ((byte >> bit) & 1) {
+                    // Found sentinel. Skip past it.
+                    // pos_ = bits consumed so far + remaining bits in this byte.
+                    pos_ = bi * 8 + (7 - bit) + 1;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 auto FseBitReader::read_bits(int n) -> std::uint32_t {
+    // Read bits from the reverse bitstream. Bytes are read in reverse order
+    // (last byte first), and within each byte, bits are read MSB to LSB.
+    // This is the reverse of the encoder's LSB-to-MSB write order.
     std::uint32_t v = 0;
     for (int i = 0; i < n; ++i) {
         if (pos_ >= size_ * 8) throw ZstdError("fse bitreader: underflow");
-        // Read from the end, backward.
-        std::size_t bit_idx = size_ * 8 - 1 - pos_;
-        std::uint32_t bit = (static_cast<std::uint8_t>(data_[bit_idx / 8])
-                             >> (bit_idx % 8)) & 1u;
+        // Which byte (from end) and which bit within that byte (MSB-first).
+        std::size_t byte_from_end = pos_ / 8;
+        std::size_t bit_from_msb = pos_ % 8;
+        std::size_t byte_idx = size_ - 1 - byte_from_end;
+        int bit_pos = 7 - static_cast<int>(bit_from_msb);  // MSB-first
+        std::uint32_t bit = (static_cast<std::uint8_t>(data_[byte_idx]) >> bit_pos) & 1u;
         v |= bit << i;
         ++pos_;
     }
@@ -504,27 +534,77 @@ auto parse_fse_table_description(const std::byte* data, std::size_t size,
 // Predefined FSE tables
 // --------------------------------------------------------------------------
 auto predefined_litlen_table() -> const FseTable& {
+    // Convert int8_t[] to int[] before building the table.
+    static int norm[kPredefLitlenSymbols];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < kPredefLitlenSymbols; ++i)
+            norm[i] = static_cast<int>(kPredefLitlenNorm[i]);
+        init = true;
+    }
     static FseTable table = build_fse_table(
-        kPredefLitlenAccuracyLog,
-        reinterpret_cast<const int*>(kPredefLitlenNorm),
-        kPredefLitlenSymbols);
+        kPredefLitlenAccuracyLog, norm, kPredefLitlenSymbols);
     return table;
 }
 
 auto predefined_matchlen_table() -> const FseTable& {
+    static int norm[kPredefMatchlenSymbols];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < kPredefMatchlenSymbols; ++i)
+            norm[i] = static_cast<int>(kPredefMatchlenNorm[i]);
+        init = true;
+    }
     static FseTable table = build_fse_table(
-        kPredefMatchlenAccuracyLog,
-        reinterpret_cast<const int*>(kPredefMatchlenNorm),
-        kPredefMatchlenSymbols);
+        kPredefMatchlenAccuracyLog, norm, kPredefMatchlenSymbols);
     return table;
 }
 
 auto predefined_offset_table() -> const FseTable& {
+    static int norm[kPredefOffsetSymbols];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < kPredefOffsetSymbols; ++i)
+            norm[i] = static_cast<int>(kPredefOffsetNorm[i]);
+        init = true;
+    }
     static FseTable table = build_fse_table(
-        kPredefOffsetAccuracyLog,
-        reinterpret_cast<const int*>(kPredefOffsetNorm),
-        kPredefOffsetSymbols);
+        kPredefOffsetAccuracyLog, norm, kPredefOffsetSymbols);
     return table;
+}
+
+// Accessors for predefined norm counts (int[] arrays for encode table building).
+auto predefined_litlen_norm() -> const int* {
+    static int norm[kPredefLitlenSymbols];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < kPredefLitlenSymbols; ++i)
+            norm[i] = static_cast<int>(kPredefLitlenNorm[i]);
+        init = true;
+    }
+    return norm;
+}
+
+auto predefined_matchlen_norm() -> const int* {
+    static int norm[kPredefMatchlenSymbols];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < kPredefMatchlenSymbols; ++i)
+            norm[i] = static_cast<int>(kPredefMatchlenNorm[i]);
+        init = true;
+    }
+    return norm;
+}
+
+auto predefined_offset_norm() -> const int* {
+    static int norm[kPredefOffsetSymbols];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < kPredefOffsetSymbols; ++i)
+            norm[i] = static_cast<int>(kPredefOffsetNorm[i]);
+        init = true;
+    }
+    return norm;
 }
 
 // ==========================================================================
@@ -547,10 +627,11 @@ void FseBitWriter::put_bit(bool bit) {
 }
 
 void FseBitWriter::align_to_byte() {
-    if (acc_bits_ > 0) {
+    while (acc_bits_ > 0) {
         out_.push_back(static_cast<std::byte>(acc_ & 0xFFu));
-        acc_ = 0;
-        acc_bits_ = 0;
+        acc_ >>= 8;
+        acc_bits_ -= 8;
+        if (acc_bits_ < 0) acc_bits_ = 0;
     }
 }
 
@@ -658,341 +739,58 @@ auto build_fse_encode_table(int accuracy_log, const int* norm_counts,
     table.table_size = 1 << accuracy_log;
     table.entries.resize(table.table_size);
     table.symbol_start.resize(max_symbol, 0);
+    table.symbol_count.resize(max_symbol, 0);
 
-    // Spread symbols across table positions (same as decoder).
-    std::uint8_t sym_table[kFseMaxTableSize * 2]{};
-    spread_symbols(sym_table, table.table_size, norm_counts, max_symbol);
+    // Build the decode table first (same as build_fse_table).
+    FseTable dtable = build_fse_table(accuracy_log, norm_counts, max_symbol);
 
-    // For each symbol, compute baseline and bits.
+    // Copy decode table entries to encode table.
+    for (int p = 0; p < table.table_size; ++p) {
+        table.entries[p].baseline = dtable.entries[p].new_state;
+        table.entries[p].bits = dtable.entries[p].bits;
+        table.entries[p].symbol = dtable.entries[p].symbol;
+    }
+
+    // Build symbol_start from the decode table.
     int pos = 0;
     for (int s = 0; s < max_symbol; ++s) {
-        int count = std::max(0, norm_counts[s]);
-        if (count == 0) continue;
-
-        table.symbol_start[s] = pos;
-
-        int max_bits = accuracy_log - highbit(static_cast<std::uint32_t>(count));
-        int min_state_plus = count << max_bits;
-
-        for (int i = 0; i < count; ++i) {
-            int p = pos + i;
-            table.entries[p].baseline =
-                static_cast<std::uint16_t>(min_state_plus - count + i);
-            table.entries[p].bits = static_cast<std::uint8_t>(max_bits);
+        int count = 0;
+        for (int p = 0; p < table.table_size; ++p) {
+            if (dtable.entries[p].symbol == s && dtable.entries[p].bits > 0) count++;
         }
+        table.symbol_start[s] = pos;
+        table.symbol_count[s] = count;
         pos += count;
     }
 
     return table;
 }
 
-// --- FSE encoding ---
 void fse_encode_one(FseBitWriter& writer, const FseEncodeTable& table,
                     std::uint32_t& state, std::uint8_t symbol) {
-    // Find the entry for the current state.
-    // The state maps to a symbol via the decode table. For encoding, we
-    // need to go from (symbol, state) to (next_state, bits).
-    // The encoding process:
-    //   1. From the current state, determine how many bits to emit.
-    //   2. Emit those bits (the low bits of the next state).
-    //   3. Update state to the next state.
-
-    // In FSE encoding, the state machine is the inverse of decoding.
-    // For encoding symbol s at state:
-    //   - Find the next_state such that decoding next_state would give s.
-    //   - The bits to emit are (state - next_state * something).
-
-    // Actually, the standard FSE encoding algorithm is:
-    //   1. For symbol s, the encoder maintains a "state" value.
-    //   2. To encode symbol s:
-    //      a. Look up the encoding table for symbol s.
-    //      b. The table gives (baseline, bits) for symbol s.
-    //      c. The number of bits to emit = bits.
-    //      d. The bits value = state - baseline (low bits).
-    //      e. The next state = (state >> bits) + baseline.
-    //      f. Wait, that's not right.
-
-    // The correct FSE encoding algorithm (from the FSE paper):
-    //   To encode symbol s with current state:
-    //     1. Find symbol s's entry in the encoding table.
-    //     2. bits = table[s].bits
-    //     3. Emit `state & ((1 << bits) - 1)` (the low bits of state).
-    //     4. state = (state >> bits) + table[s].baseline
-
-    // But this doesn't use the encoding table correctly. Let me think again.
-
-    // From the FSE paper (Duda 2009):
-    //   Encoding: given symbol s and state x:
-    //     nbBits = NbBits(x, s)  // number of bits to emit
-    //     x = (x >> nbBits) + Start(s)  // new state
-    //     emit nbBits low bits of old x
-
-    // Where:
-    //   NbBits(x, s) = accuracy_log - floor_log2(x - Start(s) + 1)? No.
-    //   Actually: NbBits(x, s) = the number of bits such that
-    //     Start(s) <= (x >> nbBits) + Start(s) < Start(s) + count[s]
-
-    // The standard implementation:
-    //   For symbol s with count C, baseline B:
-    //     if state >= B + C:  // wait, B + C can be > table_size
-    //     Actually: the state space is [0, table_size).
-    //     For symbol s, the states that encode to s are:
-    //       [B, B + C) where B = symbol_start[s] and C = count[s].
-    //     But the encoding table has entries for each STATE, not each symbol.
-
-    // I think the encoding algorithm is:
-    //   For the current state, find which symbol it maps to (from the decode table).
-    //   But we want to encode a SPECIFIC symbol. So we need to find the state
-    //   that, when decoded, gives the desired symbol.
-
-    // The correct algorithm:
-    //   To encode symbol s at state x:
-    //     1. Find the entry for state x in the decode table.
-    //     2. If entry[x].symbol == s, we can encode directly.
-    //     3. Otherwise, we need to change x to a state that decodes to s.
-
-    // Actually, the standard FSE encoding algorithm is different from what
-    // I described. Let me use the approach from the zstd reference.
-
-    // From the zstd reference (lib/compress/fse_compress.c):
-    //   FSE_encodeSymbol:
-    //     symbol = s
-    //     // Find the state for this symbol
-    //     nbBits_out = CTable[symbol].maxBits;  // from the encode table
-    //     // The encode table stores: for each symbol, the baseline and maxBits.
-    //     // The encoding:
-    //     //   bits_to_emit = state & ((1 << nbBits_out) - 1)
-    //     //   new_state = (state >> nbBits_out) + CTable[symbol].baseline
-    //     //   writer.put_bits(bits_to_emit, nbBits_out)
-    //     //   state = new_state
-
-    // Wait, but this doesn't guarantee that the decode table maps new_state
-    // back to the same symbol. The encoding table must be built so that
-    // this is the case.
-
-    // From the reference (FSE_buildCTable):
-    //   For each symbol s with count C:
-    //     maxBits = accuracy_log - floor_log2(C)
-    //     baseline = ... (computed from the symbol's position in the table)
-    //   For each state i:
-    //     symbol = tableSymbol[i]  // from the spread
-    //     CTable[i].maxBits = maxBits_for_symbol[symbol]
-    //     CTable[i].baseline = baseline_for_symbol[symbol]
-
-    // Hmm, I think the encoding table is structured differently from the
-    // decode table. Let me re-read the reference.
-
-    // From the reference (FSE_buildCTable_wksp):
-    //   For each symbol s with count > 0:
-    //     maxBits = tableLog - highbit(count)
-    //     minStatePlus = count << maxBits
-    //     For each state p for symbol s:
-    //       CTable[p].maxBits = maxBits
-    //       CTable[p].baseline = minStatePlus - count + rank_among_states_for_s
-
-    // Wait, that's the SAME as the decode table! The encode table has the
-    // same structure as the decode table: each state has (maxBits, baseline).
-
-    // So the encoding algorithm is:
-    //   To encode symbol s at state x:
-    //     1. Find a state p such that sym_table[p] == s.
-    //     2. The number of bits to emit = CTable[p].maxBits
-    //     3. The bits value = x - CTable[p].baseline  (low bits)
-    //     Wait, this doesn't make sense. x is the CURRENT state, not p.
-
-    // I think the encoding is:
-    //   The encoder maintains a state x.
-    //   To encode symbol s:
-    //     1. Find the next_state such that the decode table at next_state
-    //        would decode to s.
-    //     2. Emit the low bits of x that would transition from next_state
-    //        to x when decoding.
-    //     3. Update x = next_state.
-
-    // This is the REVERSE of decoding. In decoding:
-    //   symbol = table[state].symbol
-    //   bits = table[state].bits
-    //   next_state = table[state].baseline + read_bits(bits)
-
-    // So in encoding:
-    //   We want to encode symbol s. We need to find a next_state such that
-    //   table[next_state].symbol == s.
-    //   Then we need to emit the bits that, when read during decoding,
-    //   would transition from next_state to the current state x.
-    //   i.e., x = table[next_state].baseline + bits_value
-    //   So bits_value = x - table[next_state].baseline
-    //   And we emit bits_value using table[next_state].bits bits.
-
-    //   Then we set x = next_state.
-
-    // But how do we find next_state? We need to find a state that decodes
-    // to s and such that x - table[next_state].baseline is in
-    // [0, 2^table[next_state].bits).
-
-    // The standard approach: use the encoding table which maps each symbol
-    // to its set of states. For symbol s with count C, the states are
-    // at positions symbol_start[s]..symbol_start[s]+C-1.
-
-    // For each such state p:
-    //   bits = table[p].bits
-    //   baseline = table[p].baseline
-    //   If x - baseline is in [0, 2^bits), we can use this state.
-
-    // But this requires iterating over all states for symbol s, which is
-    // O(count) per symbol. For efficiency, we can precompute.
-
-    // Actually, the standard FSE encoding algorithm is simpler:
-    //   To encode symbol s at state x:
-    //     1. bits = encode_table[s].bits
-    //     2. baseline = encode_table[s].baseline
-    //     3. emit x & ((1 << bits) - 1)  (low bits of current state)
-    //     4. x = (x >> bits) + baseline
-
-    // This works because:
-    //   - The decode table at the NEW state (x >> bits) + baseline will
-    //     decode to s (by construction of the encoding table).
-    //   - When decoding, we read bits from the bitstream, add to baseline,
-    //     and get the next state = baseline + bits_value.
-    //   - The bits_value we emitted = x & ((1 << bits) - 1).
-    //   - So next_state = baseline + (x & ((1 << bits) - 1)).
-    //   - And (x >> bits) + baseline = baseline + (x >> bits).
-    //   - These are NOT the same! (x >> bits) + baseline ≠ baseline + (x & mask).
-
-    // Hmm, that doesn't work. Let me re-think.
-
-    // From the FSE paper (Duda 2009), the encoding algorithm is:
-    //   x_new = Start[s] + (x >> nbBits)
-    //   emit x mod 2^nbBits
-    //   x = x_new
-
-    // And the decoding algorithm is:
-    //   s = symbol[x]
-    //   nbBits = NbBits[x]
-    //   x = (x << nbBits) + read_bits(nbBits) - tableSize
-
-    // Wait, that's a different formulation. Let me use the zstd reference
-    // implementation directly.
-
-    // From the zstd reference (FSE_encodeSymbol):
-    //   void FSE_encodeSymbol(BIT_CStream_t* bitC, FSE_CState_t* statePtr,
-    //                         unsigned symbol, const FSE_symbolCompressionTransform* symbolTT) {
-    //     int nbBits_out = symbolTT[symbol].minBitsOut;
-    //     int totalBits = statePtr->state >> symbolTT[symbol].deltaNbBits;
-    //     nbBits_out -= totalBits;
-    //     BIT_addBits(bitC, statePtr->state, nbBits_out);
-    //     statePtr->state = symbolTT[symbol].deltaFindState +
-    //                       (statePtr->state >> nbBits_out);
-    //   }
-
-    // Hmm, this uses a different representation: symbolTT has minBitsOut,
-    // deltaNbBits, deltaFindState. Let me understand.
-
-    // From the reference (FSE_buildCTable):
-    //   For each symbol s with count C:
-    //     maxBits = tableLog - highbit(C)
-    //     minStatePlus = C << maxBits
-    //     symbolTT[s].minBitsOut = maxBits  // wait, this is named differently
-    //     symbolTT[s].deltaNbBits = ... // some value
-    //     symbolTT[s].deltaFindState = ... // some value
-
-    // This is getting complex. Let me use a simpler encoding algorithm
-    // that I can verify.
-
-    // The simplest correct FSE encoding algorithm:
-    //   The encoder state is a number in [0, 2 * table_size).
-    //   To encode symbol s:
-    //     1. Find all states that decode to s (from the decode table).
-    //     2. For each such state p:
-    //        a. bits = decode_table[p].bits
-    //        b. baseline = decode_table[p].baseline
-    //        c. If (state - baseline) is in [0, 2^bits):
-    //           i. Emit (state - baseline) using bits bits.
-    //           ii. state = p
-    //           iii. Done.
-
-    // But this is O(count) per symbol. For the predefined tables, counts
-    // can be up to 256. This is slow but correct.
-
-    // For efficiency, we can use the encoding table which precomputes
-    // the mapping from (symbol, state_range) to (bits, baseline).
-
-    // Actually, let me use the simplest possible approach:
-    //   The encoder state x is in [0, 2*table_size).
-    //   To encode symbol s:
-    //     For each state p in symbol_start[s]..symbol_start[s]+count[s]-1:
-    //       bits = decode_table[p].bits
-    //       baseline = decode_table[p].baseline
-    //       val = x - baseline
-    //       if val >= 0 && val < (1 << bits):
-    //         writer.put_bits(val, bits)
-    //         x = p
-    //         return
-
-    // This is correct but slow. Let me implement it this way for now.
-
-    // For the encoder, we need the decode table (not a separate encode table).
-    // Let me use the FseTable directly.
-
-    // Actually, I realize the encoding table I built (FseEncodeTable) has
-    // the same structure as the decode table: each state has (baseline, bits).
-    // So I can use it directly.
-
-    // The encoding algorithm:
-    //   For each state p that maps to symbol s:
-    //     bits = table.entries[p].bits
-    //     baseline = table.entries[p].baseline
-    //     val = state - baseline
-    //     if val >= 0 && val < (1 << bits):
-    //       writer.put_bits(val, bits)
-    //       state = p
-    //       return
-
-    // But I need to find all states for symbol s. The FseEncodeTable has
-    // symbol_start[s], but I also need the count for s.
-
-    // Let me restructure: I'll compute the count from symbol_start[s+1] - symbol_start[s].
-    // But the last symbol doesn't have a next entry. I'll store the count separately.
-
-    // For now, let me use a simple approach: iterate over all states.
-
-    int start = table.symbol_start[symbol];
-    int end = (symbol + 1 < static_cast<int>(table.symbol_start.size()))
-                  ? table.symbol_start[symbol + 1]
-                  : table.table_size;
-
-    // Correct FSE encoding algorithm (reverse-bitstream):
-    // 1. Look up decode[current_state] to get (nbBits, baseline).
-    // 2. Find a target state p for the desired symbol in [baseline, baseline + 2^nbBits).
-    // 3. Emit (p - baseline) using nbBits bits.
-    // 4. Set state = p.
-    const auto& cur = table.entries[state];
-    int nbBits = cur.bits;
-    int baseline = cur.baseline;
-
-    for (int i = start; i < end; ++i) {
-        if (i >= baseline && i < baseline + (1 << nbBits)) {
-            writer.put_bits(static_cast<std::uint32_t>(i - baseline), nbBits);
-            state = static_cast<std::uint32_t>(i);
+    int T = table.table_size;
+    for (int p = 0; p < T; ++p) {
+        if (table.entries[p].symbol != symbol) continue;
+        int bits = table.entries[p].bits;
+        int baseline = table.entries[p].baseline;
+        int val = static_cast<int>(state) - baseline;
+        if (val < 0) val += T;
+        if (val < (1 << bits)) {
+            writer.put_bits(static_cast<std::uint32_t>(val), bits);
+            state = static_cast<std::uint32_t>(p);
             return;
         }
     }
-
-    // Fallback: emit 0 bits and set state to baseline (lossy but won't hang).
-    state = static_cast<std::uint32_t>(baseline);
 }
 
 void fse_flush_state(FseBitWriter& writer, const FseEncodeTable& table,
                      std::uint32_t state) {
-    // Write the final state value using accuracy_log bits.
     writer.put_bits(state, table.accuracy_log);
 }
 
 void write_fse_table_description(FseBitWriter& writer, int accuracy_log,
                                  const int* norm_counts, int max_symbol) {
-    // Write accuracy log (4 bits, value - 5).
     writer.put_bits(static_cast<std::uint32_t>(accuracy_log - 5), 4);
-
-    // Write symbol counts using 2-bit codes.
     int remaining = 1 << accuracy_log;
     for (int s = 0; s < max_symbol && remaining > 0; ++s) {
         int count = std::max(0, norm_counts[s]);
@@ -1005,7 +803,6 @@ void write_fse_table_description(FseBitWriter& writer, int accuracy_log,
             writer.put_bits(2, 2);
             remaining -= 2;
         } else {
-            // count >= 3: code 3 + (count - 3) in (accuracy_log - 1) bits.
             writer.put_bits(3, 2);
             writer.put_bits(static_cast<std::uint32_t>(count - 3), accuracy_log - 1);
             remaining -= count;

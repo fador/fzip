@@ -107,6 +107,11 @@ auto decode_sequences(const std::byte* data, std::size_t size,
         if (matchlen_code > 52) matchlen_code = 0;
         if (litlen_code > 35) litlen_code = 0;
 
+        // DEBUG: trace decoded values.
+        std::fprintf(stderr, "DBG seq[%d]: of=%d ml=%d ll=%d states(of=%u ml=%u ll=%u)\n",
+                     i, offset_code, matchlen_code, litlen_code,
+                     of_state, ml_state, ll_state);
+
         // Resolve offset code to actual offset.
         // Codes 0-3: repeat offsets (stored as negative values for execute_sequences).
         // Codes 4+: actual distance.

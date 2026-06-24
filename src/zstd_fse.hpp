@@ -73,10 +73,16 @@ auto parse_fse_table_description(const std::byte* data, std::size_t size,
                                  int max_symbol) -> FseTable;
 
 // Predefined FSE tables for zstd sequences (RFC 8878 §4.1.1).
-// These are used when the block header indicates "predefined" mode.
+// These are used when the block header says "predefined" mode.
 auto predefined_litlen_table() -> const FseTable&;
 auto predefined_offset_table() -> const FseTable&;
 auto predefined_matchlen_table() -> const FseTable&;
+
+// Predefined normalized counts (for building encode tables that match
+// the predefined decode tables the decoder uses).
+auto predefined_litlen_norm() -> const int*;
+auto predefined_offset_norm() -> const int*;
+auto predefined_matchlen_norm() -> const int*;
 
 // --- Encoder API ---
 
@@ -102,24 +108,27 @@ class FseBitWriter {
 struct FseEncodeEntry {
     std::uint16_t baseline;  // base next-state
     std::uint8_t  bits;      // number of extra bits
+    std::uint8_t  symbol;    // symbol at this position (for encoding lookup)
 };
 
-// FSE encoding table (forward direction).
+// FSE encoding table (forward direction). Built from the same spread as
+// the decode table so positions match.
 struct FseEncodeTable {
     int accuracy_log = 0;
     int table_size = 0;
     std::vector<FseEncodeEntry> entries;
-    // symbol_start[s] = first state for symbol s
+    // symbol_start[s] = first table position for symbol s (from spread)
     std::vector<int> symbol_start;
+    // symbol_count[s] = number of table positions for symbol s
+    std::vector<int> symbol_count;
 };
 
 // Normalize symbol frequencies to a distribution with sum = 1 << accuracy_log.
-// Uses the "simple" normalization algorithm (proportional rounding).
-// Returns normalized counts (one per symbol). Negative values = -1 (fill).
 auto fse_normalize(const int* freqs, int num_symbols, int accuracy_log)
     -> std::vector<int>;
 
 // Build an FSE encoding table from normalized counts.
+// Uses the same spread algorithm as build_fse_table so positions match.
 auto build_fse_encode_table(int accuracy_log, const int* norm_counts,
                             int max_symbol) -> FseEncodeTable;
 

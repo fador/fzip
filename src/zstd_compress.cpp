@@ -234,28 +234,15 @@ void emit_sequences_section(std::vector<std::byte>& output,
     output.push_back(static_cast<std::byte>(0));
 
     // Encode sequences using FSE with predefined tables.
-    // Collect symbol frequencies for litlen, offset, matchlen.
-    int ll_freq[36]{};
-    int of_freq[32]{};
-    int ml_freq[53]{};
+    // IMPORTANT: the encoder MUST use the same tables as the decoder.
+    // Since modes=0 (predefined), the decoder uses the predefined tables.
+    // So we must build encode tables from the predefined norm counts,
+    // NOT from the actual symbol frequencies.
 
-    for (const auto& seq : sequences) {
-        int ll_code = lit_count_to_code(seq.literals_length);
-        int of_code = (seq.offset <= 3) ? seq.offset : distance_to_offset_code(seq.offset);
-        int ml_code = match_length_to_code(seq.match_length);
-        if (ll_code < 36) ll_freq[ll_code]++;
-        if (of_code < 32) of_freq[of_code]++;
-        if (ml_code < 53) ml_freq[ml_code]++;
-    }
-
-    // Normalize and build FSE tables.
-    auto ll_norm = fse_normalize(ll_freq, 36, 6);
-    auto of_norm = fse_normalize(of_freq, 32, 5);
-    auto ml_norm = fse_normalize(ml_freq, 53, 6);
-
-    auto ll_etable = build_fse_encode_table(6, ll_norm.data(), 36);
-    auto of_etable = build_fse_encode_table(5, of_norm.data(), 32);
-    auto ml_etable = build_fse_encode_table(6, ml_norm.data(), 53);
+    // Build encode tables from predefined norms (same tables the decoder uses).
+    auto ll_etable = build_fse_encode_table(6, predefined_litlen_norm(), 36);
+    auto of_etable = build_fse_encode_table(5, predefined_offset_norm(), 32);
+    auto ml_etable = build_fse_encode_table(6, predefined_matchlen_norm(), 53);
 
     // Write FSE table descriptions (inline mode, mode = 2).
     // Update the modes byte to indicate inline FSE tables.
@@ -264,122 +251,46 @@ void emit_sequences_section(std::vector<std::byte>& output,
     // For now, use predefined tables (mode 0) — simpler but worse ratio.
 
     // Encode sequences into FSE bitstream.
+    // The bitstream is written forward but read backward by the decoder.
+    // Per the reference encoder (ZSTD_encodeSequences_body):
+    //   - Process sequences in reverse order (last sequence first)
+    //   - Per sequence: OF FSE, ML FSE, LL FSE, LL extra, ML extra, OF extra
+    //   - Flush states: ML, OF, LL
+    //   - Sentinel (1 bit) + byte align
     FseBitWriter fse_writer;
     std::uint32_t ll_state = 0;
     std::uint32_t of_state = 0;
     std::uint32_t ml_state = 0;
 
-    // Write initial states (accuracy_log bits each, at the START of the stream).
-    // Actually, the FSE bitstream for sequences is written in reverse:
-    // the LAST sequence is encoded first, and the bitstream is read backward.
-    // For simplicity, encode in forward order and write the bitstream as-is.
-    // The decoder will need to read it backward. This means we need to
-    // reverse the bitstream after encoding.
-
-    // Actually, the zstd format writes the FSE bitstream forward, but the
-    // decoder reads it backward. The encoder writes symbols in reverse order
-    // (last sequence first). Let me implement this correctly.
-
-    // For simplicity, encode sequences in reverse order.
     for (int i = num_seq - 1; i >= 0; --i) {
         const auto& seq = sequences[i];
         int ll_code = lit_count_to_code(seq.literals_length);
         int of_code = (seq.offset <= 3) ? seq.offset : distance_to_offset_code(seq.offset);
         int ml_code = match_length_to_code(seq.match_length);
 
-        // Encode extra bits (forward, before the FSE symbol).
-        // Actually, the extra bits are interleaved with the FSE bitstream.
-        // The order is: FSE symbol first, then extra bits.
-        // But the FSE bitstream is read backward, so the extra bits for
-        // the LAST sequence come first in the forward bitstream.
+        // FSE symbols: offset, matchlen, litlen.
+        fse_encode_one(fse_writer, of_etable, of_state,
+                       static_cast<std::uint8_t>(of_code));
+        fse_encode_one(fse_writer, ml_etable, ml_state,
+                       static_cast<std::uint8_t>(ml_code));
+        fse_encode_one(fse_writer, ll_etable, ll_state,
+                       static_cast<std::uint8_t>(ll_code));
 
-        // For simplicity, emit FSE symbols first, then extra bits.
-        // The decoder reads: FSE symbol, then extra bits, for each sequence.
-
-        // Actually, the zstd format interleaves FSE bits and extra bits.
-        // The forward bitstream contains:
-        //   [extra bits for seq 0] [FSE bits for seq 0] [extra bits for seq 1] ...
-        // And the backward reader reads: FSE bits first, then extra bits.
-
-        // For simplicity, I'll emit all FSE bits first, then all extra bits.
-        // This won't match the zstd format exactly, but the decoder can
-        // handle it if we structure the output correctly.
-
-        // Actually, let me just emit the FSE bits and extra bits in the
-        // correct zstd format. The format is:
-        //   Forward bitstream: [extra bits] [FSE bits]
-        //   Backward reader: reads FSE bits first, then extra bits.
-
-        // For each sequence (in reverse order):
-        //   1. Write extra bits for litlen (forward)
-        //   2. Write extra bits for matchlen (forward)
-        //   3. Write extra bits for offset (forward)
-        //   4. Write FSE symbol for litlen
-        //   5. Write FSE symbol for matchlen
-        //   6. Write FSE symbol for offset
-
-        // Wait, I think the order is different. Let me re-read.
-
-        // From the spec: the bitstream is read in reverse. The first symbol
-        // decoded (from the backward reader) is the LAST sequence's offset.
-        // Then matchlen, then litlen. Then the second-to-last sequence's
-        // offset, matchlen, litlen. Etc.
-
-        // So in the forward bitstream, the order is:
-        //   [first sequence's litlen extra] [first sequence's matchlen extra]
-        //   [first sequence's offset extra] [first sequence's litlen FSE]
-        //   [first sequence's matchlen FSE] [first sequence's offset FSE]
-        //   [second sequence's litlen extra] ...
-
-        // And the backward reader reads: offset FSE, matchlen FSE, litlen FSE,
-        // offset extra, matchlen extra, litlen extra, then the next sequence.
-
-        // For simplicity, I'll emit extra bits before FSE bits for each sequence.
-        // The backward reader will then read FSE bits first, then extra bits.
-
-        // Actually, I think the correct format is:
-        //   Forward: [extra_bits_0] [FSE_bits_0] [extra_bits_1] [FSE_bits_1] ...
-        //   Backward: reads FSE_bits first (in reverse), then extra_bits.
-
-        // Let me just emit extra bits first, then FSE symbol, for each sequence
-        // in forward order. The backward reader will handle it.
-
-        // For the FSE encoding, I need to encode in REVERSE order (last sequence
-        // first) because the FSE state machine reads backward.
-
-        // OK, this is getting complex. Let me simplify: encode all sequences
-        // in forward order using FSE, then emit the bitstream as-is.
-        // The decoder will need to handle this.
-
-        // For a minimal implementation, let me use predefined FSE tables
-        // and emit the sequences without extra bits optimization.
-
-        // Write: litlen_extra, litlen_FSE, matchlen_extra, matchlen_FSE,
-        //        offset_extra, offset_FSE.
-        // Reading backward: offset_FSE, offset_extra, matchlen_FSE,
-        //                   matchlen_extra, litlen_FSE, litlen_extra.
-
-        // Litlen extra bits + FSE symbol.
+        // Extra bits: litlen, matchlen, offset.
         int ll_extra = litlen_code_to_extra(ll_code);
         if (ll_extra > 0) {
             int ll_base = litlen_code_to_base(ll_code);
             fse_writer.put_bits(
                 static_cast<std::uint32_t>(seq.literals_length - ll_base), ll_extra);
         }
-        fse_encode_one(fse_writer, ll_etable, ll_state,
-                       static_cast<std::uint8_t>(ll_code));
 
-        // Matchlen extra bits + FSE symbol.
         int ml_extra = matchlen_code_to_extra(ml_code);
         if (ml_extra > 0) {
             int ml_base = matchlen_code_to_base(ml_code);
             fse_writer.put_bits(
                 static_cast<std::uint32_t>(seq.match_length - ml_base), ml_extra);
         }
-        fse_encode_one(fse_writer, ml_etable, ml_state,
-                       static_cast<std::uint8_t>(ml_code));
 
-        // Offset extra bits + FSE symbol.
         if (of_code >= 4) {
             int of_extra = of_code - 2;
             int of_base = (1 << (of_code - 2)) + 1;
@@ -388,18 +299,15 @@ void emit_sequences_section(std::vector<std::byte>& output,
                     static_cast<std::uint32_t>(seq.offset - of_base), of_extra);
             }
         }
-        fse_encode_one(fse_writer, of_etable, of_state,
-                       static_cast<std::uint8_t>(of_code));
     }
 
-    // Flush FSE states in REVERSE order (of, ml, ll).
-    // When the decoder reads backward from the end, it reads ll first,
-    // then ml, then of — matching the spec order.
+    // Flush states: OF(5), ML(6), LL(6).
     fse_flush_state(fse_writer, of_etable, of_state);
     fse_flush_state(fse_writer, ml_etable, ml_state);
     fse_flush_state(fse_writer, ll_etable, ll_state);
 
-    // The FSE bitstream needs a 1-bit sentinel at the end.
+    // Sentinel: a single 1-bit, then zero-pad to byte boundary.
+    // The decoder finds this 1-bit when reading backward from the end.
     fse_writer.put_bit(true);
     fse_writer.align_to_byte();
 
@@ -418,10 +326,10 @@ auto compress(std::span<const std::byte> data, int level,
 
     std::size_t size = data.size();
 
-    // Build frame with raw blocks (type 0).
-    // The FSE-based compressed block encoder is implemented but the
-    // reverse-bitstream FSE encoding produces incorrect output for
-    // sequences. Using raw blocks ensures correct round-trip.
+    // Raw-block compressor (type 0). The FSE-based compressed block encoder
+    // is implemented but the reverse-bitstream FSE encoding has unresolved
+    // issues with sentinel positioning and bit ordering. Using raw blocks
+    // ensures correct round-trip.
     // TODO: fix FSE encoding for compressed blocks.
     std::vector<std::byte> output;
 
