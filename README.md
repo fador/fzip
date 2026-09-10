@@ -82,10 +82,10 @@ Config                  Size   Ratio  Compress   Decompress
 fzip store          1008.8 KB   0.964 54.0 MB/s   52.0 MB/s
 fzip deflate-6       661.5 KB   1.469 19.0 MB/s   27.8 MB/s
 fzip deflate-9       661.4 KB   1.470 17.3 MB/s   28.1 MB/s
-fzip zstd-1          684.6 KB   1.420 28.2 MB/s   32.7 MB/s
-fzip zstd-9          661.3 KB   1.470  9.4 MB/s   38.7 MB/s
-fzip zstd-19         656.9 KB   1.480  1.5 MB/s   30.0 MB/s
-fzip auto            656.9 KB   1.480  1.6 MB/s   32.0 MB/s
+fzip zstd-1          684.6 KB   1.420 35.3 MB/s   36.8 MB/s
+fzip zstd-9          661.3 KB   1.470 16.7 MB/s   38.3 MB/s
+fzip zstd-19         656.9 KB   1.480  3.2 MB/s   34.4 MB/s
+fzip auto            656.9 KB   1.480  3.2 MB/s   34.2 MB/s
 7za deflate-5        643.0 KB   1.512 10.6 MB/s   31.8 MB/s
 7za deflate-9        640.1 KB   1.518  2.8 MB/s   30.0 MB/s
 7za LZMA-9           632.9 KB   1.536 11.0 MB/s   22.0 MB/s
@@ -110,7 +110,9 @@ fzip source (231 KB)   59749     58117   -2.7%
 Compression throughput improved ~2x because entries are now compressed in
 parallel across CPU cores (written in order, so output is deterministic).
 A 1000-file / 18 MB archive compresses ~4.7x faster than the sequential
-path.
+path. Blocks within a single file are also compressed in parallel (they are
+independent), so large-file compression scales with cores too: a 13 MB file
+at zstd-19 went from ~35 s to ~2.5 s.
 
 Extraction speed also improved substantially: the Huffman inflate now uses
 an O(1) canonical lookup table (was an O(symbols) scan per bit), CRC-32 uses
