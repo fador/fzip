@@ -48,6 +48,14 @@ class FseBitReader {
     // Read `n` bits (1-24) from the reverse bitstream.
     auto read_bits(int n) -> std::uint32_t;
 
+    // Read `n` bits without advancing. Bits past the start of the stream read
+    // as 0 (used by the Huffman decoder, whose table lookup only depends on
+    // the leading bits of the peeked value).
+    auto peek_bits(int n) -> std::uint32_t;
+
+    // Skip `n` bits without reading.
+    void skip_bits(int n) { pos_ += static_cast<std::size_t>(n); }
+
     // Get the current FSE state (initial state = first `accuracy_log` bits).
     auto get_state(int accuracy_log) -> std::uint32_t;
 

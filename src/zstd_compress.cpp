@@ -12,6 +12,7 @@
 
 #include "xxhash.hpp"
 #include "zstd_fse.hpp"
+#include "zstd_huffman.hpp"
 #include "zstd_predefined.hpp"
 
 namespace fzip::zstd {
@@ -201,9 +202,72 @@ const FseCTable& ml_ctable() {
 }
 
 // --- Section emission ---
-void emit_raw_literals(std::vector<std::byte>& out,
-                       const std::vector<std::uint8_t>& lits) {
-    int n = static_cast<int>(lits.size());
+// Write a little-endian bitfield header for the literals section.
+void put_literals_header(std::vector<std::byte>& out, int type, int size_format,
+                         int regen, int csize, int k) {
+    std::uint64_t v = static_cast<std::uint64_t>(type) |
+                      (static_cast<std::uint64_t>(size_format) << 2) |
+                      (static_cast<std::uint64_t>(regen) << 4) |
+                      (static_cast<std::uint64_t>(csize) << (4 + k));
+    const int nbytes = (4 + 2 * k) / 8;
+    for (int i = 0; i < nbytes; ++i) {
+        out.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
+    }
+}
+
+// Emit the literals section, choosing Huffman (Compressed), RLE, or Raw.
+void emit_literals(std::vector<std::byte>& out,
+                   const std::vector<std::uint8_t>& lits) {
+    const int n = static_cast<int>(lits.size());
+
+    // Try Huffman-coded literals (4-stream).
+    if (n >= 64) {
+        std::vector<std::byte> body;
+        if (huf_compress_literals(lits.data(), n, body)) {
+            const int m = std::max(n, static_cast<int>(body.size()));
+            int size_format;
+            int k;
+            if (m <= 1023) {
+                size_format = 1; k = 10;
+            } else if (m <= 16383) {
+                size_format = 2; k = 14;
+            } else {
+                size_format = 3; k = 18;
+            }
+            const int hdr_bytes = (4 + 2 * k) / 8;
+            if (static_cast<int>(body.size()) + hdr_bytes < n) {
+                put_literals_header(out, 2, size_format, n,
+                                    static_cast<int>(body.size()), k);
+                out.insert(out.end(), body.begin(), body.end());
+                return;
+            }
+        }
+    }
+
+    // RLE literals.
+    bool all_same = n > 0;
+    for (int i = 1; i < n; ++i) {
+        if (lits[static_cast<std::size_t>(i)] != lits[0]) {
+            all_same = false;
+            break;
+        }
+    }
+    if (all_same) {
+        if (n <= 31) {
+            out.push_back(static_cast<std::byte>((n << 3) | (0 << 2) | 1));
+        } else if (n <= 4095) {
+            out.push_back(static_cast<std::byte>(((n & 0xF) << 4) | (1 << 2) | 1));
+            out.push_back(static_cast<std::byte>((n >> 4) & 0xFF));
+        } else {
+            out.push_back(static_cast<std::byte>(((n & 0xF) << 4) | (3 << 2) | 1));
+            out.push_back(static_cast<std::byte>((n >> 4) & 0xFF));
+            out.push_back(static_cast<std::byte>((n >> 12) & 0xFF));
+        }
+        out.push_back(static_cast<std::byte>(lits[0]));
+        return;
+    }
+
+    // Raw literals.
     if (n <= 31) {
         // 1-byte header, Size_Format 0, type 0 (Raw).
         out.push_back(static_cast<std::byte>((n << 3)));
@@ -291,7 +355,7 @@ auto build_compressed_block(const std::uint8_t* data, std::size_t size,
     std::vector<Seq> seqs = build_sequences(data, size, effort, literals);
     if (seqs.empty()) return false;  // nothing to gain from a compressed block
     out.clear();
-    emit_raw_literals(out, literals);
+    emit_literals(out, literals);
     emit_sequences(out, seqs);
     return out.size() < size;
 }

@@ -161,46 +161,81 @@ auto read_num_sequences(const std::byte* p, const std::byte* end,
            (static_cast<std::uint8_t>(p[1]) << 8) + 0x7F00;
 }
 
-// Decode literals from a compressed literals block (raw and RLE only; the
-// encoder never emits Huffman-coded literals).
+// Decode the literals section (raw, RLE, or Huffman-compressed).
 auto decode_literals(const std::byte* data, std::size_t size,
                      std::size_t& consumed) -> std::vector<std::byte> {
     if (size < 1) throw ZstdError("literals block: too short");
     const std::byte* p = data;
     const std::byte* end = data + size;
     std::uint8_t h0 = static_cast<std::uint8_t>(*p);
-    int type = h0 & 3;  // 0 = Raw, 1 = RLE
+    int type = h0 & 3;  // 0 = Raw, 1 = RLE, 2 = Compressed, 3 = Treeless
     int size_format = (h0 >> 2) & 3;
-    int regen;
-    int hdr_size;
-    if (size_format == 0 || size_format == 2) {
-        hdr_size = 1;
-        regen = h0 >> 3;
-    } else if (size_format == 1) {
-        if (p + 1 >= end) throw ZstdError("literals header: truncated");
-        hdr_size = 2;
-        regen = (h0 >> 4) +
-                (static_cast<int>(static_cast<std::uint8_t>(p[1])) << 4);
-    } else {
-        if (p + 2 >= end) throw ZstdError("literals header: truncated");
-        hdr_size = 3;
-        regen = (h0 >> 4) +
-                (static_cast<int>(static_cast<std::uint8_t>(p[1])) << 4) +
-                (static_cast<int>(static_cast<std::uint8_t>(p[2])) << 12);
-    }
-    p += hdr_size;
-    if (type == 0) {  // Raw
-        if (p + regen > end) throw ZstdError("raw literals: truncated");
-        consumed = static_cast<std::size_t>(p - data) +
-                   static_cast<std::size_t>(regen);
-        return std::vector<std::byte>(p, p + regen);
-    }
-    if (type == 1) {  // RLE
+
+    if (type == 0 || type == 1) {
+        int regen;
+        int hdr_size;
+        if (size_format == 0 || size_format == 2) {
+            hdr_size = 1;
+            regen = h0 >> 3;
+        } else if (size_format == 1) {
+            if (p + 1 >= end) throw ZstdError("literals header: truncated");
+            hdr_size = 2;
+            regen = (h0 >> 4) +
+                    (static_cast<int>(static_cast<std::uint8_t>(p[1])) << 4);
+        } else {
+            if (p + 2 >= end) throw ZstdError("literals header: truncated");
+            hdr_size = 3;
+            regen = (h0 >> 4) +
+                    (static_cast<int>(static_cast<std::uint8_t>(p[1])) << 4) +
+                    (static_cast<int>(static_cast<std::uint8_t>(p[2])) << 12);
+        }
+        p += hdr_size;
+        if (type == 0) {  // Raw
+            if (p + regen > end) throw ZstdError("raw literals: truncated");
+            consumed = static_cast<std::size_t>(p - data) +
+                       static_cast<std::size_t>(regen);
+            return std::vector<std::byte>(p, p + regen);
+        }
+        // RLE
         if (p >= end) throw ZstdError("rle literals: truncated");
         consumed = static_cast<std::size_t>(p - data) + 1;
         return std::vector<std::byte>(static_cast<std::size_t>(regen), *p);
     }
-    throw ZstdError("Huffman-coded literals are not supported");
+
+    if (type == 2) {
+        const int k = (size_format == 0 || size_format == 1)
+                          ? 10
+                          : (size_format == 2 ? 14 : 18);
+        const int hdr_size = (4 + 2 * k) / 8;
+        if (p + hdr_size > end) throw ZstdError("literals header: truncated");
+        std::uint64_t v = 0;
+        for (int i = 0; i < hdr_size; ++i) {
+            v |= static_cast<std::uint64_t>(
+                     static_cast<std::uint8_t>(p[i])) << (8 * i);
+        }
+        const int regen = static_cast<int>((v >> 4) & ((1u << k) - 1));
+        const int csize = static_cast<int>((v >> (4 + k)) & ((1u << k) - 1));
+        const std::byte* body = p + hdr_size;
+        if (body + csize > end) throw ZstdError("compressed literals: truncated");
+
+        HufTable t;
+        std::size_t weight_consumed = 0;
+        if (!huf_read_weights(body, static_cast<std::size_t>(csize), t,
+                              weight_consumed)) {
+            throw ZstdError("unsupported Huffman weight encoding");
+        }
+        const std::byte* streams = body + weight_consumed;
+        const std::size_t streams_size =
+            static_cast<std::size_t>(csize) - weight_consumed;
+        auto lits = huf_decode_streams(t, streams, streams_size, regen,
+                                       size_format);
+        consumed = static_cast<std::size_t>(p - data) +
+                   static_cast<std::size_t>(hdr_size) +
+                   static_cast<std::size_t>(csize);
+        return lits;
+    }
+
+    throw ZstdError("treeless literals block not supported");
 }
 
 // Decompress one compressed block.
