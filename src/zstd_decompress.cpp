@@ -3,7 +3,10 @@
 #include "zstd.hpp"
 #include "zstd_internal.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <thread>
 
 #include "xxhash.hpp"
 #include "zstd_fse.hpp"
@@ -413,11 +416,15 @@ auto decompress(std::span<const std::byte> data, std::size_t) -> std::vector<std
         return {};
     }
 
-    std::vector<std::byte> output;
-    if (!hdr.fcs_unknown && hdr.frame_content_size > 0) {
-        output.reserve(static_cast<std::size_t>(hdr.frame_content_size));
-    }
-
+    // Parse all blocks up front. fzip's blocks are independent (matches never
+    // cross block boundaries), so they can be decoded in parallel.
+    struct BlockJob {
+        const std::byte* data = nullptr;
+        std::size_t size = 0;
+        BlockHeader hdr;
+        std::vector<std::byte> decoded;
+    };
+    std::vector<BlockJob> jobs;
     while (p < end) {
         BlockHeader blk;
         std::size_t blk_bytes = 0;
@@ -433,11 +440,49 @@ auto decompress(std::span<const std::byte> data, std::size_t) -> std::vector<std
         const std::size_t content_len =
             (blk.type == BlockType::RLE) ? 1 : blk.block_size;
         const std::size_t avail = static_cast<std::size_t>(end - p);
-        auto block_data = decompress_block(p, std::min(content_len, avail), blk);
-        output.insert(output.end(), block_data.begin(), block_data.end());
+        BlockJob job;
+        job.data = p;
+        job.size = std::min(content_len, avail);
+        job.hdr = blk;
+        jobs.push_back(std::move(job));
         p += content_len;
 
         if (blk.last_block) break;
+    }
+
+    auto decode_job = [&](BlockJob& j) {
+        j.decoded = decompress_block(j.data, j.size, j.hdr);
+    };
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 1;
+    if (jobs.size() < 2 || hw <= 1) {
+        for (BlockJob& j : jobs) {
+            decode_job(j);
+        }
+    } else {
+        const unsigned nw =
+            std::min<unsigned>(hw, static_cast<unsigned>(jobs.size()));
+        std::atomic<std::size_t> next{0};
+        std::vector<std::thread> workers;
+        workers.reserve(nw);
+        for (unsigned t = 0; t < nw; ++t) {
+            workers.emplace_back([&]() {
+                for (;;) {
+                    std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= jobs.size()) break;
+                    decode_job(jobs[i]);
+                }
+            });
+        }
+        for (auto& worker : workers) worker.join();
+    }
+
+    std::vector<std::byte> output;
+    if (!hdr.fcs_unknown && hdr.frame_content_size > 0) {
+        output.reserve(static_cast<std::size_t>(hdr.frame_content_size));
+    }
+    for (const BlockJob& j : jobs) {
+        output.insert(output.end(), j.decoded.begin(), j.decoded.end());
     }
 
     if (hdr.content_checksum) {

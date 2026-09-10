@@ -1,10 +1,14 @@
 // fzip — ZIP container reader implementation.
 #include "zip_reader.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <span>
 #include <stdexcept>
+#include <thread>
 
 #include "codec.hpp"
 #include "crc32.hpp"
@@ -221,10 +225,45 @@ auto extract_all(const std::string& archive_path)
     -> std::vector<std::pair<std::string, std::vector<std::byte>>> {
     auto data = io::read_file(archive_path);
     auto entries = parse_zip_entries(data);
-    std::vector<std::pair<std::string, std::vector<std::byte>>> result;
-    result.reserve(entries.size());
-    for (const auto& e : entries) {
-        result.emplace_back(e.name, extract_entry_from(data, e));
+    const std::size_t n = entries.size();
+    std::vector<std::pair<std::string, std::vector<std::byte>>> result(n);
+    std::vector<std::exception_ptr> errors(n, nullptr);
+
+    // Entries are independent, so decompress them on a thread pool. Errors are
+    // captured per entry and rethrown on the calling thread.
+    auto do_entry = [&](std::size_t i) {
+        try {
+            result[i].first = entries[i].name;
+            result[i].second = extract_entry_from(data, entries[i]);
+        } catch (...) {
+            errors[i] = std::current_exception();
+        }
+    };
+
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 1;
+    if (n < 2 || hw <= 1) {
+        for (std::size_t i = 0; i < n; ++i) do_entry(i);
+    } else {
+        const unsigned nw =
+            std::min<unsigned>(hw, static_cast<unsigned>(n));
+        std::atomic<std::size_t> next{0};
+        std::vector<std::thread> workers;
+        workers.reserve(nw);
+        for (unsigned t = 0; t < nw; ++t) {
+            workers.emplace_back([&]() {
+                for (;;) {
+                    std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= n) break;
+                    do_entry(i);
+                }
+            });
+        }
+        for (auto& worker : workers) worker.join();
+    }
+
+    for (const auto& e : errors) {
+        if (e) std::rethrow_exception(e);
     }
     return result;
 }
