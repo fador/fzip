@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <span>
 #include <stdexcept>
 
 #include "codec.hpp"
@@ -106,14 +107,15 @@ auto parse_cd_entry(const std::byte* p, const std::byte* end,
 
 }  // namespace
 
-auto read_zip_entries(const std::string& archive_path)
+namespace {
+
+auto parse_zip_entries(std::span<const std::byte> data)
     -> std::vector<ZipReadEntry> {
-    auto data = io::read_file(archive_path);
     const std::byte* base = data.data();
     const std::byte* end = base + data.size();
 
     const std::byte* eocd = find_eocd(base, data.size());
-    if (!eocd) throw std::runtime_error("no EOCD found in " + archive_path);
+    if (!eocd) throw std::runtime_error("no EOCD found");
 
     // Parse EOCD: get CD offset and size.
     auto cd_size_32 = read_u32(eocd + 12);
@@ -157,15 +159,24 @@ auto read_zip_entries(const std::string& archive_path)
     return entries;
 }
 
-auto extract_entry(const std::string& archive_path, const ZipReadEntry& entry)
-    -> std::vector<std::byte> {
+}  // namespace
+
+auto read_zip_entries(const std::string& archive_path)
+    -> std::vector<ZipReadEntry> {
     auto data = io::read_file(archive_path);
-    const std::byte* base = data.data();
+    return parse_zip_entries(data);
+}
+
+namespace {
+
+auto extract_entry_from(std::span<const std::byte> archive,
+                        const ZipReadEntry& entry) -> std::vector<std::byte> {
+    const std::byte* base = archive.data();
 
     // Read the local header at entry.local_header_offset to get the actual
     // compressed data offset (header may have different extra fields than CD).
     auto off = entry.local_header_offset;
-    if (off + 30 > data.size()) {
+    if (off + 30 > archive.size()) {
         throw std::runtime_error("local header offset out of bounds");
     }
     const std::byte* lh = base + off;
@@ -175,7 +186,7 @@ auto extract_entry(const std::string& archive_path, const ZipReadEntry& entry)
     auto name_len = read_u16(lh + 26);
     auto extra_len = read_u16(lh + 28);
     auto data_offset = off + 30 + name_len + extra_len;
-    if (data_offset + entry.compressed_size > data.size()) {
+    if (data_offset + entry.compressed_size > archive.size()) {
         throw std::runtime_error("compressed data out of bounds");
     }
 
@@ -198,14 +209,22 @@ auto extract_entry(const std::string& archive_path, const ZipReadEntry& entry)
     return result;
 }
 
+}  // namespace
+
+auto extract_entry(const std::string& archive_path, const ZipReadEntry& entry)
+    -> std::vector<std::byte> {
+    auto data = io::read_file(archive_path);
+    return extract_entry_from(data, entry);
+}
+
 auto extract_all(const std::string& archive_path)
     -> std::vector<std::pair<std::string, std::vector<std::byte>>> {
-    auto entries = read_zip_entries(archive_path);
+    auto data = io::read_file(archive_path);
+    auto entries = parse_zip_entries(data);
     std::vector<std::pair<std::string, std::vector<std::byte>>> result;
     result.reserve(entries.size());
     for (const auto& e : entries) {
-        auto data = extract_entry(archive_path, e);
-        result.emplace_back(e.name, std::move(data));
+        result.emplace_back(e.name, extract_entry_from(data, e));
     }
     return result;
 }

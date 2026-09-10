@@ -104,118 +104,161 @@ auto build_canonical_codes(const std::array<int, N>& lengths, int max_sym)
     return h;
 }
 
-// A min-heap entry for Huffman tree construction.
-struct HeapNode {
-    std::uint64_t freq;
-    int idx;  // index into a node pool (negative = leaf symbol)
+// A fast canonical Huffman decoder. Code lengths are grouped by length;
+// within a length, symbols are stored in increasing symbol order, matching
+// the canonical code assignment above. Decoding accumulates one bit at a
+// time and checks the O(1) table for each length, instead of scanning all
+// symbols for every bit.
+struct HuffDecoder {
+    std::array<int, 16> count{};        // #codes of each length
+    std::array<int, 16> first_code{};   // first canonical code of each length
+    std::array<int, 16> first_index{};  // offset into symbols[] per length
+    std::array<int, 288> symbols{};     // sorted by (length, symbol)
+    int max_len = 0;
 };
-auto heap_less(const HeapNode& a, const HeapNode& b) -> bool {
-    return a.freq > b.freq;  // priority_queue is a max-heap by default
+
+template <std::size_t N>
+auto build_huff_decoder(const std::array<int, N>& lengths, int max_sym)
+    -> HuffDecoder {
+    HuffDecoder d;
+    for (int s = 0; s < max_sym; ++s) {
+        int len = lengths[s];
+        if (len > 0 && len <= 15) d.count[len]++;
+    }
+    int code = 0;
+    int idx = 0;
+    for (int len = 1; len <= 15; ++len) {
+        d.first_code[len] = code;
+        d.first_index[len] = idx;
+        code = (code + d.count[len]) << 1;
+        idx += d.count[len];
+        if (d.count[len] > 0) d.max_len = len;
+    }
+    std::array<int, 16> next = d.first_index;
+    for (int s = 0; s < max_sym; ++s) {
+        int len = lengths[s];
+        if (len > 0 && len <= 15) d.symbols[next[len]++] = s;
+    }
+    return d;
 }
 
-// Build Huffman code lengths from frequencies, limited to `max_len` bits.
+// Length-limited prefix code lengths using the package-merge algorithm
+// (Larmore-Hirschberg), ported from Stephan Brumme's public-domain
+// implementation. `A` must be a histogram sorted ascending with no zeros;
+// on return it holds the code lengths in the same order. Returns the actual
+// maximum code length. Unlike a clamp-and-redistribute heuristic this always
+// yields a *complete* prefix code (Kraft sum == 1), which zlib requires for
+// literal/length and distance trees ("invalid literal/lengths set" otherwise).
+auto package_merge_sorted(int max_length, std::vector<std::uint64_t>& A) -> int {
+    int num_codes = static_cast<int>(A.size());
+    if (num_codes == 0 || max_length == 0) return 0;
+    if (num_codes <= 2) {
+        A[0] = 1;
+        if (num_codes == 2) A[1] = 1;
+        return 1;
+    }
+    if (max_length > 63) return 0;
+    if ((1ULL << max_length) < static_cast<std::uint64_t>(num_codes)) return 0;
+
+    using BitMask = std::uint64_t;
+    const int max_buffer = 2 * num_codes;
+    std::vector<std::uint64_t> current(static_cast<std::size_t>(max_buffer));
+    std::vector<std::uint64_t> previous(static_cast<std::size_t>(max_buffer));
+    std::vector<BitMask> is_merged(static_cast<std::size_t>(max_buffer), 0);
+    for (int i = 0; i < num_codes; ++i) previous[i] = A[i];
+    int num_previous = num_codes;
+    const int num_relevant = 2 * num_codes - 2;
+
+    // Phase 1: package pairs and merge with the original histogram.
+    BitMask mask = 1;
+    for (int bits = max_length - 1; bits > 0; --bits) {
+        num_previous &= ~1;
+        current[0] = A[0];
+        current[1] = A[1];
+        std::uint64_t sum = current[0] + current[1];
+        int num_current = 2;
+        int num_hist = 2;
+        int num_merged = 0;
+        for (;;) {
+            if (num_hist < num_codes && A[num_hist] <= sum) {
+                current[num_current++] = A[num_hist++];
+                continue;
+            }
+            is_merged[num_current] |= mask;
+            current[num_current] = sum;
+            ++num_current;
+            ++num_merged;
+            if (num_merged * 2 >= num_previous) break;
+            sum = previous[num_merged * 2] + previous[num_merged * 2 + 1];
+        }
+        while (num_hist < num_codes) current[num_current++] = A[num_hist++];
+        mask <<= 1;
+
+        if (num_previous >= num_relevant) {
+            bool keep_going = false;
+            for (int i = num_relevant - 1; i > 0; --i) {
+                if (previous[i] != current[i]) { keep_going = true; break; }
+            }
+            if (!keep_going) break;
+        }
+        std::swap(previous, current);
+        num_previous = num_current;
+    }
+    mask >>= 1;
+
+    // Phase 2: walk the merge masks to derive code lengths.
+    std::vector<unsigned int> code_lengths(static_cast<std::size_t>(num_codes), 0);
+    int num_analyze = num_relevant;
+    while (mask != 0) {
+        int num_merged = 0;
+        code_lengths[0]++;
+        code_lengths[1]++;
+        int symbol = 2;
+        for (int i = symbol; i < num_analyze; ++i) {
+            if ((is_merged[i] & mask) == 0) {
+                code_lengths[symbol]++;
+                ++symbol;
+            } else {
+                ++num_merged;
+            }
+        }
+        num_analyze = 2 * num_merged;
+        mask >>= 1;
+    }
+    for (int i = 0; i < num_analyze; ++i) code_lengths[i]++;
+    for (int i = 0; i < num_codes; ++i) {
+        A[i] = code_lengths[static_cast<std::size_t>(i)];
+    }
+    return static_cast<int>(code_lengths[0]);
+}
+
+// Build length-limited Huffman code lengths from a frequency array.
 // Template works for any array size (288 for lit, 32 for dist, 19 for CL).
 template <std::size_t N>
 auto build_huff_lengths(const std::array<std::uint32_t, N>& freqs,
                         int max_sym, int max_len) -> std::array<int, N> {
     std::array<int, N> lengths{};
-    // Collect nonzero symbols.
     struct Sym {
-        std::uint32_t f;
+        std::uint64_t f;
         int s;
     };
     std::vector<Sym> syms;
+    syms.reserve(max_sym);
     for (int s = 0; s < max_sym; ++s) {
         if (freqs[s] > 0) syms.push_back({freqs[s], s});
     }
     if (syms.empty()) return lengths;
-    if (syms.size() == 1) {
-        // A single symbol: give it a 1-bit code (DEFLATE convention).
-        lengths[syms[0].s] = 1;
-        return lengths;
-    }
-
-    // Build Huffman tree via a priority queue (pairing freqs).
-    struct Node {
-        std::uint64_t freq;
-        int parent;
-    };
-    std::vector<Node> nodes;
-    nodes.reserve(syms.size() * 2);
-    for (auto& sp : syms) {
-        nodes.push_back({sp.f, -1});
-    }
-    auto cmp = [&nodes](int a, int b) { return nodes[a].freq > nodes[b].freq; };
-    std::vector<int> heap;
-    heap.reserve(syms.size());
-    for (int i = 0; i < static_cast<int>(syms.size()); ++i) heap.push_back(i);
-    std::make_heap(heap.begin(), heap.end(), cmp);
-    while (heap.size() > 1) {
-        std::pop_heap(heap.begin(), heap.end(), cmp);
-        int a = heap.back(); heap.pop_back();
-        std::pop_heap(heap.begin(), heap.end(), cmp);
-        int b = heap.back(); heap.pop_back();
-        Node n{nodes[a].freq + nodes[b].freq, -1};
-        int ni = static_cast<int>(nodes.size());
-        nodes.push_back(n);
-        nodes[a].parent = ni;
-        nodes[b].parent = ni;
-        heap.push_back(ni);
-        std::push_heap(heap.begin(), heap.end(), cmp);
-    }
-    // Walk from each leaf to root to get depth = code length.
-    int max_depth = 0;
-    for (int i = 0; i < static_cast<int>(syms.size()); ++i) {
-        int d = 0;
-        int p = nodes[i].parent;
-        while (p != -1) { ++d; p = nodes[p].parent; }
-        lengths[syms[i].s] = d;
-        if (d > max_depth) max_depth = d;
-    }
-
-    // Length-limit: if max_depth > max_len, clamp and fix.
-    if (max_depth > max_len) {
-        // Simple iterative clamp: sort symbols by freq desc, clamp lengths
-        // to max_len, then for symbols with length 0 due to clamping
-        // reassignment, bump shorter codes. This is the "BZip2-style" fix
-        // and is not strictly optimal but is correct (codes are prefix-free
-        // by construction below).
-        // Sort symbol indices by frequency descending.
-        std::vector<int> order(syms.size());
-        for (int i = 0; i < static_cast<int>(syms.size()); ++i) order[i] = i;
-        std::sort(order.begin(), order.end(),
-                  [&](int a, int b) { return syms[a].f > syms[b].f; });
-        // Assign lengths via a Kraft-inequality bounded redistribution.
-        std::array<int, N> newlen{};
-        // Use the package-merge result approximation: give the most frequent
-        // symbols the shortest clamped lengths.
-        // We use a simple greedy: assign lengths so that sum of 2^-len <= 1.
-        // Start all at max_len, then shorten the highest-freq ones.
-        for (int i = 0; i < static_cast<int>(syms.size()); ++i) {
-            newlen[syms[order[i]].s] = max_len;
-        }
-        // Try to shorten: while we can reduce some length and still satisfy
-        // Kraft, do it for the highest-frequency symbol that can be reduced.
-        bool improved = true;
-        while (improved) {
-            improved = false;
-            for (int oi = 0; oi < static_cast<int>(syms.size()); ++oi) {
-                int s = syms[order[oi]].s;
-                if (newlen[s] <= 1) continue;
-                // Check Kraft: sum 2^-len over all must be <= 1 after reducing.
-                double k = 0.0;
-                for (int i = 0; i < static_cast<int>(syms.size()); ++i) {
-                    k += 1.0 / (1u << newlen[syms[i].s]);
-                }
-                // Reducing newlen[s] by 1 adds 1/2^(len-1) - 1/2^len = 1/2^len.
-                double delta = 1.0 / (1u << (newlen[s] - 1));
-                if (k + delta <= 1.0 + 1e-12) {
-                    newlen[s]--;
-                    improved = true;
-                }
-            }
-        }
-        lengths = newlen;
+    // Package-merge needs ascending weights with no zeros. Break ties by
+    // symbol index for determinism, then map the lengths back.
+    std::sort(syms.begin(), syms.end(), [](const Sym& a, const Sym& b) {
+        if (a.f != b.f) return a.f < b.f;
+        return a.s < b.s;
+    });
+    std::vector<std::uint64_t> hist(syms.size());
+    for (std::size_t i = 0; i < syms.size(); ++i) hist[i] = syms[i].f;
+    package_merge_sorted(max_len, hist);
+    for (std::size_t i = 0; i < syms.size(); ++i) {
+        lengths[syms[i].s] = static_cast<int>(hist[i]);
     }
     return lengths;
 }
@@ -739,15 +782,13 @@ class BitReader {
         }
         return v;
     }
-    auto get_huff(const HuffCodes& h) -> int {
-        int code = 0, len = 0;
-        while (len <= 15) {
-            code = (code << 1) | get_bits(1);
-            ++len;
-            for (int s = 0; s < h.max_sym; ++s) {
-                if (h.lengths[s] == len && h.codes[s] == static_cast<std::uint32_t>(code)) {
-                    return s;
-                }
+    auto get_huff(const HuffDecoder& d) -> int {
+        int code = 0;
+        for (int len = 1; len <= d.max_len; ++len) {
+            code = (code << 1) | static_cast<int>(get_bits(1));
+            int idx = code - d.first_code[len];
+            if (idx >= 0 && idx < d.count[len]) {
+                return d.symbols[d.first_index[len] + idx];
             }
         }
         throw std::runtime_error("invalid Huffman code");
@@ -782,14 +823,10 @@ auto inflate_block(BitReader& r, std::vector<std::byte>& out) -> bool {
         for (int s = 144; s <= 255; ++s) lit_lens[s] = 9;
         for (int s = 256; s <= 279; ++s) lit_lens[s] = 7;
         for (int s = 280; s <= 287; ++s) lit_lens[s] = 8;
-        auto lit = build_canonical_codes(lit_lens, 288);
-        std::array<int, 32> dlens{}; dlens.fill(5);
-        HuffCodes dist = build_canonical_codes(dlens, 30);
-        // Rebuild dist with all-5-bit codes via canonical step.
-        std::array<int, 16> bl{}; bl[5] = 30;
-        std::array<std::uint32_t, 16> nc{}; std::uint32_t c = 0;
-        for (int b = 1; b <= 15; ++b) { c = (c + bl[b-1]) << 1; nc[b] = c; }
-        for (int s = 0; s < 30; ++s) dist.codes[s] = nc[5]++;
+        auto lit = build_huff_decoder(lit_lens, 288);
+        std::array<int, 32> dlens{};
+        dlens.fill(5);
+        auto dist = build_huff_decoder(dlens, 30);
         while (true) {
             int sym = r.get_huff(lit);
             if (sym == 256) break;
@@ -826,7 +863,7 @@ auto inflate_block(BitReader& r, std::vector<std::byte>& out) -> bool {
                                        2,14,1,15};
         std::array<int, 19> cl_lens{};
         for (int i = 0; i < hclen; ++i) cl_lens[order[i]] = r.get_bits(3);
-        auto cl = build_canonical_codes(cl_lens, 19);
+        auto cl = build_huff_decoder(cl_lens, 19);
         std::vector<int> all_lens;
         all_lens.reserve(hlit + hdist);
         while (static_cast<int>(all_lens.size()) < hlit + hdist) {
@@ -849,8 +886,8 @@ auto inflate_block(BitReader& r, std::vector<std::byte>& out) -> bool {
         for (int i = 0; i < hlit; ++i) lit_lens[i] = all_lens[i];
         std::array<int, 32> dist_lens{};
         for (int i = 0; i < hdist; ++i) dist_lens[i] = all_lens[hlit + i];
-        auto lit = build_canonical_codes(lit_lens, hlit);
-        auto dist = build_canonical_codes(dist_lens, hdist);
+        auto lit = build_huff_decoder(lit_lens, hlit);
+        auto dist = build_huff_decoder(dist_lens, hdist);
         while (true) {
             int sym = r.get_huff(lit);
             if (sym == 256) break;
