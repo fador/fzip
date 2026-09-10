@@ -17,13 +17,13 @@ A state-of-the-art ZIP compressor in C++20, built to benchmark against
     streams, repeat offsets), full frame/block parsing.
   - **Compressor**: emits spec-correct **compressed blocks** — literals are
     Huffman-coded (4-stream, with FSE- or direct-encoded weight tables) when
-    beneficial, otherwise RLE/raw, and sequences are FSE-coded using the
-    predefined distributions. Frame/block headers and the content checksum
-    follow RFC 8878. Verified against 7za 25.01 and fzip's own extractor.
-  - Not yet ratio-competitive with deflate: sequence symbols use the
-    predefined FSE tables rather than per-block optimized tables, and the
-    LZ77 parser is greedy (no lazy/optimal matching). `auto` therefore still
-    prefers deflate.
+    beneficial, otherwise RLE/raw, and sequences are FSE-coded with
+    **per-block tables** (RLE for single-symbol streams, predefined for tiny
+    blocks). Frame/block headers and the content checksum follow RFC 8878.
+    Verified against 7za 25.01 and fzip's own extractor.
+  - Ratio now matches deflate while decoding much faster. Remaining ratio
+    work: lazy/optimal LZ77 parsing. `auto` picks zstd-19 for text,
+    executables, and general binary.
 - **Per-file codec selection** based on magic-byte type detection:
   incompressible → Store, executables → deflate-9, text → deflate-9,
   general binary → deflate-6.
@@ -78,22 +78,20 @@ Synthetic corpus: 9 files (text/binary/mixed at 4K/64K/256K each, ~972 KB).
 ```
 Config                  Size   Ratio  Compress   Decompress
 --------------------------------------------------------------
-fzip store          1008.8 KB   0.964 56.7 MB/s   52.0 MB/s
-fzip deflate-6       661.5 KB   1.469 19.2 MB/s   28.0 MB/s
-fzip deflate-9       661.4 KB   1.470 16.5 MB/s   27.6 MB/s
-fzip zstd-1          749.0 KB   1.298 36.1 MB/s   39.8 MB/s
-fzip zstd-19         709.9 KB   1.369 15.4 MB/s   39.3 MB/s
-fzip auto            661.4 KB   1.470 16.9 MB/s   28.4 MB/s
-7za deflate-5        643.0 KB   1.512 10.1 MB/s   31.8 MB/s
-7za deflate-9        640.1 KB   1.518  2.7 MB/s   30.8 MB/s
-7za LZMA-9           632.9 KB   1.536 11.3 MB/s   21.2 MB/s
+fzip store          1008.8 KB   0.964 54.0 MB/s   52.0 MB/s
+fzip deflate-6       661.5 KB   1.469 19.0 MB/s   27.8 MB/s
+fzip deflate-9       661.4 KB   1.470 17.3 MB/s   28.1 MB/s
+fzip zstd-1          684.6 KB   1.420 32.4 MB/s   35.6 MB/s
+fzip zstd-19         661.4 KB   1.470 15.4 MB/s   37.8 MB/s
+fzip auto            661.4 KB   1.470 15.1 MB/s   40.5 MB/s
+7za deflate-5        643.0 KB   1.512 10.6 MB/s   31.8 MB/s
+7za deflate-9        640.1 KB   1.518  2.8 MB/s   30.0 MB/s
+7za LZMA-9           632.9 KB   1.536 11.0 MB/s   22.0 MB/s
 ```
 
-The custom zstd compressor now emits real compressed blocks (previously raw
-blocks only). It trades ratio for decode speed: faster than deflate to
-decompress, but larger because literals are stored raw and the sequence
-symbols use the predefined FSE tables. Deflate still wins on ratio, so
-`auto` keeps using it.
+The custom zstd path now matches deflate's ratio while decoding
+substantially faster (per-block FSE tables + Huffman literals). `auto`
+routes text, executables, and general binary to zstd-19.
 
 The synthetic corpus is dominated by near-incompressible mixed data, so it
 understates the deflate improvements. On realistic inputs the lazy matcher
@@ -126,9 +124,9 @@ The package-merge builder guarantees a complete, optimal length-limited code.
 
 The custom zstd path is now spec-correct end to end: `fzip zstd` output is
 decoded successfully by 7za 25.01 as well as by `fzip extract`, including
-Huffman-coded literals (with FSE- or direct-encoded weight tables).
-Remaining ratio work for zstd: per-block FSE sequence tables (instead of
-predefined) and lazy/optimal parsing.
+Huffman-coded literals (with FSE- or direct-encoded weight tables) and
+per-block sequence FSE tables. Remaining ratio work for zstd: lazy/optimal
+LZ77 parsing.
 
 ## State-of-the-art analysis
 
