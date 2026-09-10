@@ -181,19 +181,17 @@ FseBitReader::FseBitReader(const std::byte* data, std::size_t size)
 }
 
 auto FseBitReader::read_bits(int n) -> std::uint32_t {
-    // Read bits from the reverse bitstream. Bytes are read in reverse order
-    // (last byte first), and within each byte, bits are read MSB to LSB.
-    // This is the reverse of the encoder's LSB-to-MSB write order.
+    // The reverse bitstream recovers each multi-bit element in its original
+    // bit order (only the element order is reversed). Assemble MSB-first.
     std::uint32_t v = 0;
     for (int i = 0; i < n; ++i) {
         if (pos_ >= size_ * 8) throw ZstdError("fse bitreader: underflow");
-        // Which byte (from end) and which bit within that byte (MSB-first).
         std::size_t byte_from_end = pos_ / 8;
         std::size_t bit_from_msb = pos_ % 8;
         std::size_t byte_idx = size_ - 1 - byte_from_end;
         int bit_pos = 7 - static_cast<int>(bit_from_msb);  // MSB-first
         std::uint32_t bit = (static_cast<std::uint8_t>(data_[byte_idx]) >> bit_pos) & 1u;
-        v |= bit << i;
+        v = (v << 1) | bit;
         ++pos_;
     }
     return v;
@@ -821,6 +819,143 @@ void write_fse_table_description(FseBitWriter& writer, int accuracy_log,
             remaining -= count;
         }
     }
+}
+
+// ==========================================================================
+// Spec-correct FSE encoder (ported from zstd v1.5.7 FSE_buildCTable_wksp and
+// the FSE_encodeSymbol / FSE_initCState2 / FSE_flushCState inlines).
+// ==========================================================================
+
+namespace {
+
+// floor(log2(x)) for x >= 1.
+auto highbit_u32(std::uint32_t x) -> int {
+    int r = 0;
+    while (x > 1) { x >>= 1; ++r; }
+    return r;
+}
+
+}  // namespace
+
+auto build_fse_ctable(int table_log, const std::int16_t* norm, int max_symbol)
+    -> FseCTable {
+    FseCTable ct;
+    ct.table_log = table_log;
+    ct.table_size = 1 << table_log;
+    const int table_size = ct.table_size;
+    const int table_mask = table_size - 1;
+    const int step = (table_size >> 1) + (table_size >> 3) + 3;
+    const int max_sv1 = max_symbol + 1;
+
+    std::vector<int> cumul(static_cast<std::size_t>(max_sv1) + 1, 0);
+    std::vector<std::uint8_t> table_symbol(static_cast<std::size_t>(table_size), 0);
+    int high_threshold = table_size - 1;
+
+    // Symbol start positions. Low-probability (-1) symbols get a single state,
+    // placed from the end of the table.
+    cumul[0] = 0;
+    for (int u = 1; u <= max_sv1; ++u) {
+        if (norm[u - 1] == -1) {
+            cumul[u] = cumul[u - 1] + 1;
+            table_symbol[static_cast<std::size_t>(high_threshold--)] =
+                static_cast<std::uint8_t>(u - 1);
+        } else {
+            cumul[u] = cumul[u - 1] + norm[u - 1];
+        }
+    }
+    cumul[static_cast<std::size_t>(max_sv1)] = table_size + 1;
+
+    // Spread symbols across the table.
+    if (high_threshold == table_size - 1) {
+        std::vector<std::uint8_t> spread(static_cast<std::size_t>(table_size), 0);
+        int pos = 0;
+        for (int s = 0; s < max_sv1; ++s) {
+            for (int i = 0; i < norm[s]; ++i) {
+                spread[static_cast<std::size_t>(pos++)] =
+                    static_cast<std::uint8_t>(s);
+            }
+        }
+        int position = 0;
+        for (int i = 0; i < table_size; ++i) {
+            table_symbol[static_cast<std::size_t>(position) & table_mask] =
+                spread[static_cast<std::size_t>(i)];
+            position = (position + step) & table_mask;
+        }
+    } else {
+        int position = 0;
+        for (int symbol = 0; symbol < max_sv1; ++symbol) {
+            const int freq = norm[symbol];
+            for (int j = 0; j < freq; ++j) {
+                table_symbol[static_cast<std::size_t>(position)] =
+                    static_cast<std::uint8_t>(symbol);
+                position = (position + step) & table_mask;
+                while (position > high_threshold) {
+                    position = (position + step) & table_mask;
+                }
+            }
+        }
+    }
+
+    // Build the state table, grouped by symbol (next state values).
+    ct.state_table.assign(static_cast<std::size_t>(table_size), 0);
+    for (int u = 0; u < table_size; ++u) {
+        const std::uint8_t s = table_symbol[static_cast<std::size_t>(u)];
+        ct.state_table[static_cast<std::size_t>(cumul[s]++)] =
+            static_cast<std::uint16_t>(table_size + u);
+    }
+
+    // Symbol transformation table.
+    ct.delta_find_state.assign(static_cast<std::size_t>(max_symbol) + 1, 0);
+    ct.delta_nb_bits.assign(static_cast<std::size_t>(max_symbol) + 1, 0);
+    unsigned total = 0;
+    for (int s = 0; s <= max_symbol; ++s) {
+        const int n = norm[s];
+        if (n == 0) {
+            ct.delta_nb_bits[s] = static_cast<std::uint32_t>(
+                ((table_log + 1) << 16) - (1 << table_log));
+            ct.delta_find_state[s] = 0;
+        } else if (n == -1 || n == 1) {
+            ct.delta_nb_bits[s] = static_cast<std::uint32_t>(
+                (table_log << 16) - (1 << table_log));
+            ct.delta_find_state[s] = static_cast<std::int32_t>(total - 1);
+            ++total;
+        } else {
+            const int hb = highbit_u32(static_cast<std::uint32_t>(n - 1));
+            const int max_bits_out = table_log - hb;
+            const unsigned min_state_plus =
+                static_cast<unsigned>(n) << max_bits_out;
+            ct.delta_nb_bits[s] = static_cast<std::uint32_t>(
+                (max_bits_out << 16) - min_state_plus);
+            ct.delta_find_state[s] =
+                static_cast<std::int32_t>(total - static_cast<unsigned>(n));
+            total += static_cast<unsigned>(n);
+        }
+    }
+    return ct;
+}
+
+auto fse_init_cstate2(const FseCTable& ct, int symbol) -> std::uint32_t {
+    const std::uint32_t delta_nb_bits = ct.delta_nb_bits[symbol];
+    const std::uint32_t nb_bits_out = (delta_nb_bits + (1u << 15)) >> 16;
+    std::uint32_t value = (nb_bits_out << 16) - delta_nb_bits;
+    const int idx = static_cast<int>(value >> nb_bits_out) +
+                    ct.delta_find_state[symbol];
+    value = ct.state_table[static_cast<std::size_t>(idx)];
+    return value;
+}
+
+void fse_encode_symbol(FseBitWriter& w, const FseCTable& ct,
+                       std::uint32_t& value, int symbol) {
+    const std::uint32_t delta_nb_bits = ct.delta_nb_bits[symbol];
+    const std::uint32_t nb_bits_out = (value + delta_nb_bits) >> 16;
+    w.put_bits(value, static_cast<int>(nb_bits_out));
+    const int idx = static_cast<int>(value >> nb_bits_out) +
+                    ct.delta_find_state[symbol];
+    value = ct.state_table[static_cast<std::size_t>(idx)];
+}
+
+void fse_flush_cstate(FseBitWriter& w, const FseCTable& ct, std::uint32_t value) {
+    w.put_bits(value, ct.table_log);
 }
 
 }  // namespace fzip::zstd

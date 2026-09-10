@@ -1,38 +1,33 @@
 // fzip — zstd compressor implementation (RFC 8878).
-// Greedy LZ77 match finder + FSE sequence encoding + Huffman literal encoding.
+//
+// Emits spec-compliant compressed blocks: a raw literals section followed by
+// a sequences section encoded with the predefined FSE tables (symbol
+// compression mode 0). LZ77 uses a greedy hash-chain match finder over a
+// 32 KiB window, matching the frame's declared window.
 #include "zstd.hpp"
 #include "zstd_internal.hpp"
 
 #include <algorithm>
 #include <cstring>
-#include <numeric>
 
 #include "xxhash.hpp"
 #include "zstd_fse.hpp"
-#include "zstd_huffman.hpp"
-#include "zstd_sequence.hpp"
+#include "zstd_predefined.hpp"
 
 namespace fzip::zstd {
 
 namespace {
 
-// Reverse the low `n` bits of `v`.
-auto reverse_bits(std::uint32_t v, int n) -> std::uint32_t {
-    std::uint32_t r = 0;
-    for (int i = 0; i < n; ++i) {
-        r = (r << 1) | ((v >> i) & 1u);
-    }
-    return r;
-}
-
-// --- LZ77 match finder (3-byte hash, hash-chain, greedy) ---
+// --- LZ77 match finder (3-byte hash, hash-chain, 32 KiB window) ---
 constexpr int kHashBits = 16;
 constexpr int kHashSize = 1 << kHashBits;
 constexpr int kHashMask = kHashSize - 1;
-constexpr int kWindow = 32768;
+constexpr int kWindow = 131072;   // 128 KiB
 constexpr int kMinMatch = 3;
 constexpr int kMaxMatch = 131074;  // zstd max match length
-constexpr int kMaxDistance = (1 << 30);  // zstd max distance
+
+// Block content (and decompressed size) is capped by min(window, 128 KiB).
+constexpr int kBlockSize = 131072;
 
 struct Match {
     int distance = 0;
@@ -58,7 +53,13 @@ auto find_match(const std::uint8_t* data, std::size_t size, std::size_t pos,
     int tries = effort;
     while (cand >= 0 && tries-- > 0) {
         if (cand < limit) break;
-        int maxl = static_cast<int>(std::min<std::size_t>(kMaxMatch, size - pos));
+        if (best.length > kMinMatch &&
+            data[cand + best.length - 1] != data[pos + best.length - 1]) {
+            cand = prev[static_cast<std::size_t>(cand) & (kWindow - 1)];
+            continue;
+        }
+        int maxl = static_cast<int>(std::min<std::size_t>(
+            static_cast<std::size_t>(kMaxMatch), size - pos));
         int l = 0;
         while (l < maxl && data[cand + l] == data[pos + l]) ++l;
         if (l >= kMinMatch && l > best.length) {
@@ -76,259 +77,223 @@ void insert_hash(const std::uint8_t* data, std::size_t size, std::size_t pos,
     if (pos + kMinMatch > size) return;
     std::uint32_t h = hash3(data + pos);
     int p = static_cast<int>(pos);
-    prev[p & (kWindow - 1)] = head[h];
+    prev[static_cast<std::size_t>(p) & (kWindow - 1)] = head[h];
     head[h] = p;
 }
 
-// --- Sequence building ---
-// A raw match from the LZ77 pass.
-struct RawMatch {
-    std::size_t pos;      // position in input
-    int lit_count;        // number of preceding literals
-    int distance;         // match distance
-    int match_length;     // match length
+// One sequence: `lit_len` literals, then a match of `match_len` at
+// `match_dist` bytes back.
+struct Seq {
+    int lit_len = 0;
+    int match_len = 0;
+    int match_dist = 0;
 };
 
-// Convert distance to offset code (RFC 8878 §4.2.2.3).
-// Codes 0-3 are special (repeat offsets).
-// Code >= 4: distance = (1 << (code - 2)) + extra + 1, extra has (code-2) bits.
-auto distance_to_offset_code(int distance) -> int {
-    if (distance <= 0) return 0;
-    if (distance <= 3) return distance;  // codes 1-3: repeat offsets
-    // For code >= 4: max_distance(code) = 2 * (1 << (code - 2))
-    // Find smallest code such that 2^(code-1) >= distance.
-    for (int code = 4; code < 32; ++code) {
-        if ((1 << (code - 1)) >= distance) return code;
-    }
-    return 31;
-}
+auto build_sequences(const std::uint8_t* data, std::size_t size, int effort,
+                     std::vector<std::uint8_t>& literals) -> std::vector<Seq> {
+    std::vector<Seq> seqs;
+    literals.clear();
 
-// Convert match length to matchlen code.
-auto match_length_to_code(int length) -> int {
-    // Matchlen codes: 0-31 direct (base=length-3), 32+ with extra bits.
-    if (length < 3) return 0;
-    if (length <= 34) return length - 3;  // codes 0-31
-    length -= 3;
-    // Find the code for lengths > 34.
-    // Code 32: base=35, extra=1 → 35-36
-    // Code 33: base=37, extra=1 → 37-38
-    // Code 34: base=39, extra=1 → 39-40
-    // Code 35: base=41, extra=1 → 41-42
-    // Code 36: base=43, extra=2 → 43-46
-    // ...
-    for (int c = 32; c < 53; ++c) {
-        int base = matchlen_code_to_base(c);
-        int extra = matchlen_code_to_extra(c);
-        if (length >= base && length < base + (1 << extra)) return c;
-    }
-    return 52;
-}
-
-// Convert literal count to litlen code.
-auto lit_count_to_code(int count) -> int {
-    if (count <= 15) return count;
-    if (count <= 30) return 16 + (count - 16) / 2;
-    if (count <= 44) return 24 + (count - 32) / 4;
-    if (count <= 72) return 28 + (count - 48) / 8;
-    if (count <= 128) return 32 + (count - 80) / 16;
-    return 35;
-}
-
-// Build sequences from raw matches.
-auto build_sequences(const std::uint8_t* data, std::size_t size,
-                     const std::vector<RawMatch>& matches,
-                     std::vector<std::byte>& literals_out)
-    -> std::vector<Sequence> {
-    std::vector<Sequence> seqs;
-    literals_out.clear();
+    std::vector<int> head(kHashSize, -1);
+    std::vector<int> prev(kWindow, -1);
 
     std::size_t pos = 0;
-    for (const auto& m : matches) {
-        // Emit literals before this match.
-        for (int i = 0; i < m.lit_count; ++i) {
-            literals_out.push_back(static_cast<std::byte>(data[pos + i]));
-        }
-        pos += m.lit_count;
-
-        Sequence seq;
-        seq.literals_length = m.lit_count;
-        seq.match_length = m.match_length;
-        seq.offset = m.distance;
-        seqs.push_back(seq);
-
-        pos += m.match_length;
-    }
-    // Emit remaining literals.
+    std::size_t lit_start = 0;
     while (pos < size) {
-        literals_out.push_back(static_cast<std::byte>(data[pos]));
-        pos++;
+        Match m = find_match(data, size, pos, head, prev, effort);
+        if (m.length >= kMinMatch) {
+            for (std::size_t i = lit_start; i < pos; ++i) {
+                literals.push_back(data[i]);
+            }
+            Seq s;
+            s.lit_len = static_cast<int>(pos - lit_start);
+            s.match_len = m.length;
+            s.match_dist = m.distance;
+            seqs.push_back(s);
+            for (int i = 0; i < m.length; ++i) {
+                insert_hash(data, size, pos + i, head, prev);
+            }
+            pos += static_cast<std::size_t>(m.length);
+            lit_start = pos;
+        } else {
+            insert_hash(data, size, pos, head, prev);
+            ++pos;
+        }
     }
-
+    for (std::size_t i = lit_start; i < size; ++i) {
+        literals.push_back(data[i]);
+    }
     return seqs;
 }
 
-// --- Compressed block emission ---
-void emit_literals_section(std::vector<std::byte>& output,
-                           const std::vector<std::byte>& literals) {
-    int lit_size = static_cast<int>(literals.size());
-    if (lit_size < 64) {
-        // Raw literals (size_format = 0, type = raw).
-        // Header: size_format=0, regenerated_size = lit_size.
-        // lhType = 0 (raw), so regenerated_size = lit_size.
-        output.push_back(static_cast<std::byte>((lit_size << 2) | 0));
-        output.push_back(static_cast<std::byte>(lit_size >> 6));
-        output.insert(output.end(), literals.begin(), literals.end());
-    } else if (lit_size < 64 + 255) {
-        // RLE literals.
-        output.push_back(static_cast<std::byte>(((lit_size) << 2) | 0));
-        output.push_back(static_cast<std::byte>((lit_size) >> 6));
-        output.push_back(literals[0]);
-    } else {
-        // Huffman-coded literals (1-stream, size_format = 0).
-        // Compute Huffman weights from literal frequencies.
-        int freq[256]{};
-        for (auto b : literals) freq[static_cast<std::uint8_t>(b)]++;
+// --- Code tables (RFC 8878 §4.2.2) ---
+struct Code {
+    int code = 0;
+    int extra_bits = 0;
+    int extra_val = 0;
+};
 
-        auto lengths = compute_huff_lengths(freq, 256, 12);
-        auto codes = build_huff_encode_table(lengths.data(), 256);
-
-        // Encode literals.
-        std::vector<std::byte> huff_data;
-        encode_huffman_stream(codes,
-                              reinterpret_cast<const std::uint8_t*>(literals.data()),
-                              lit_size, huff_data);
-
-        // Build weight table (code lengths are weights).
-        // Convert code lengths to weights (0 = not present, otherwise weight = length).
-        int weights[256]{};
-        for (int s = 0; s < 256; ++s) {
-            weights[s] = lengths[s];
-        }
-
-        // Header: size_format=0, regenerated_size = lit_size (after subtracting 64+255).
-        int regen = lit_size - (64 + 255);
-        output.push_back(static_cast<std::byte>((regen << 2) | 0));
-        output.push_back(static_cast<std::byte>(regen >> 6));
-
-        // Write Huffman weights in direct mode.
-        write_huffman_weights_direct(weights, 256, output);
-
-        // Write compressed literal data.
-        output.insert(output.end(), huff_data.begin(), huff_data.end());
+Code lit_len_code(int len) {
+    static const int kBase[36] = {
+        0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+        16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048,
+        4096, 8192, 16384, 32768, 65536};
+    static const int kExtra[36] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    for (int c = 35; c >= 0; --c) {
+        if (len >= kBase[c]) return {c, kExtra[c], len - kBase[c]};
     }
+    return {0, 0, 0};
 }
 
-void emit_sequences_section(std::vector<std::byte>& output,
-                            const std::vector<Sequence>& sequences,
-                            [[maybe_unused]] const std::vector<std::byte>& literals) {
-    int num_seq = static_cast<int>(sequences.size());
+Code match_len_code(int len) {
+    static const int kBase[53] = {
+        3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18,
+        19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+        35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515, 1027,
+        2051, 4099, 8195, 16387, 32771, 65539};
+    static const int kExtra[53] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    for (int c = 52; c >= 0; --c) {
+        if (len >= kBase[c]) return {c, kExtra[c], len - kBase[c]};
+    }
+    return {0, 0, 0};
+}
 
-    // Write number of sequences.
-    if (num_seq == 0) {
-        output.push_back(static_cast<std::byte>(0));
+// Offset code: Offset_Value = (1 << code) + extra, offset = Offset_Value - 3.
+// Codes 0..1 are repeat codes; explicit offsets use code >= 2.
+Code offset_code(int dist) {
+    int v = dist + 3;
+    int code = 0;
+    while ((1 << (code + 1)) <= v) ++code;
+    if (code < 2) code = 2;  // never use repeat codes
+    return {code, code, v - (1 << code)};
+}
+
+// --- Predefined normalized distributions (RFC 8878 §4.1.1) ---
+constexpr std::int16_t kLLNorm[36] = {
+    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+    -1, -1, -1, -1};
+constexpr std::int16_t kOFNorm[29] = {
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1};
+constexpr std::int16_t kMLNorm[53] = {
+    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1,
+    -1, -1, -1, -1, -1};
+
+const FseCTable& ll_ctable() {
+    static const FseCTable ct = build_fse_ctable(6, kLLNorm, 35);
+    return ct;
+}
+const FseCTable& of_ctable() {
+    static const FseCTable ct = build_fse_ctable(5, kOFNorm, 28);
+    return ct;
+}
+const FseCTable& ml_ctable() {
+    static const FseCTable ct = build_fse_ctable(6, kMLNorm, 52);
+    return ct;
+}
+
+// --- Section emission ---
+void emit_raw_literals(std::vector<std::byte>& out,
+                       const std::vector<std::uint8_t>& lits) {
+    int n = static_cast<int>(lits.size());
+    if (n <= 31) {
+        // 1-byte header, Size_Format 0, type 0 (Raw).
+        out.push_back(static_cast<std::byte>((n << 3)));
+    } else if (n <= 4095) {
+        // 2-byte header, Size_Format 1.
+        out.push_back(static_cast<std::byte>(((n & 0xF) << 4) | (1 << 2)));
+        out.push_back(static_cast<std::byte>((n >> 4) & 0xFF));
+    } else {
+        // 3-byte header, Size_Format 3.
+        out.push_back(static_cast<std::byte>(((n & 0xF) << 4) | (3 << 2)));
+        out.push_back(static_cast<std::byte>((n >> 4) & 0xFF));
+        out.push_back(static_cast<std::byte>((n >> 12) & 0xFF));
+    }
+    for (std::uint8_t b : lits) out.push_back(static_cast<std::byte>(b));
+}
+
+void emit_sequences(std::vector<std::byte>& out, const std::vector<Seq>& seqs) {
+    const int n = static_cast<int>(seqs.size());
+    if (n == 0) {
+        out.push_back(std::byte{0});
         return;
     }
-    if (num_seq < 128) {
-        output.push_back(static_cast<std::byte>(num_seq));
-    } else if (num_seq < 32896) {
-        output.push_back(static_cast<std::byte>(((num_seq - 128) >> 8) + 128));
-        output.push_back(static_cast<std::byte>((num_seq - 128) & 0xFF));
+    // Number_of_Sequences.
+    if (n < 128) {
+        out.push_back(static_cast<std::byte>(n));
+    } else if (n <= 0x7EFF) {
+        out.push_back(static_cast<std::byte>(128 + (n >> 8)));
+        out.push_back(static_cast<std::byte>(n & 0xFF));
     } else {
-        output.push_back(static_cast<std::byte>(((num_seq - 32896) >> 16) + 192));
-        output.push_back(static_cast<std::byte>(((num_seq - 32896) >> 8) & 0xFF));
-        output.push_back(static_cast<std::byte>((num_seq - 32896) & 0xFF));
+        int v = n - 0x7F00;
+        out.push_back(static_cast<std::byte>(255));
+        out.push_back(static_cast<std::byte>(v & 0xFF));
+        out.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
     }
+    // Symbol compression modes: all predefined (0).
+    out.push_back(std::byte{0});
 
-    // Symbol modes byte: all predefined (mode 0 for litlen, offset, matchlen).
-    output.push_back(static_cast<std::byte>(0));
+    const FseCTable& ll = ll_ctable();
+    const FseCTable& of = of_ctable();
+    const FseCTable& ml = ml_ctable();
 
-    // Encode sequences using FSE with predefined tables.
-    // IMPORTANT: the encoder MUST use the same tables as the decoder.
-    // Since modes=0 (predefined), the decoder uses the predefined tables.
-    // So we must build encode tables from the predefined norm counts,
-    // NOT from the actual symbol frequencies.
+    FseBitWriter w;
+    std::uint32_t ll_state = 0, of_state = 0, ml_state = 0;
 
-    // Build encode tables from predefined norms (same tables the decoder uses).
-    auto ll_etable = build_fse_encode_table(6, predefined_litlen_norm(), 36);
-    auto of_etable = build_fse_encode_table(5, predefined_offset_norm(), 32);
-    auto ml_etable = build_fse_encode_table(6, predefined_matchlen_norm(), 53);
-
-    // Write FSE table descriptions (inline mode, mode = 2).
-    // Update the modes byte to indicate inline FSE tables.
-    // The modes byte was already written as 0 (predefined). We need to
-    // rewrite it. Actually, let me write it AFTER computing the tables.
-    // For now, use predefined tables (mode 0) — simpler but worse ratio.
-
-    // Encode sequences into FSE bitstream.
-    // The bitstream is written forward but read backward by the decoder.
-    // Per the reference encoder (ZSTD_encodeSequences_body):
-    //   - Process sequences in reverse order (last sequence first)
-    //   - Per sequence: OF FSE, ML FSE, LL FSE, LL extra, ML extra, OF extra
-    //   - Flush states: ML, OF, LL
-    //   - Sentinel (1 bit) + byte align
-    FseBitWriter fse_writer;
-    std::uint32_t ll_state = 0;
-    std::uint32_t of_state = 0;
-    std::uint32_t ml_state = 0;
-
-    for (int i = num_seq - 1; i >= 0; --i) {
-        const auto& seq = sequences[i];
-        int ll_code = lit_count_to_code(seq.literals_length);
-        int of_code = (seq.offset <= 3) ? seq.offset : distance_to_offset_code(seq.offset);
-        int ml_code = match_length_to_code(seq.match_length);
-
-        // Decoder reads (from backward stream): OF FSE, ML FSE, LL FSE,
-        // LL extra, ML extra, OF extra. So forward write order must be:
-        // OF extra, ML extra, LL extra, LL FSE, ML FSE, OF FSE.
-
-        // OF extra bits (read last by decoder → written first).
-        if (of_code >= 4) {
-            int of_extra = of_code - 2;
-            int of_base = (1 << (of_code - 2)) + 1;
-            if (of_extra > 0) {
-                fse_writer.put_bits(
-                    reverse_bits(static_cast<std::uint32_t>(seq.offset - of_base), of_extra), of_extra);
-            }
-        }
-
-        // ML extra bits.
-        int ml_extra = matchlen_code_to_extra(ml_code);
-        if (ml_extra > 0) {
-            int ml_base = matchlen_code_to_base(ml_code);
-            fse_writer.put_bits(
-                reverse_bits(static_cast<std::uint32_t>(seq.match_length - ml_base), ml_extra), ml_extra);
-        }
-
-        // LL extra bits.
-        int ll_extra = litlen_code_to_extra(ll_code);
-        if (ll_extra > 0) {
-            int ll_base = litlen_code_to_base(ll_code);
-            fse_writer.put_bits(
-                reverse_bits(static_cast<std::uint32_t>(seq.literals_length - ll_base), ll_extra), ll_extra);
-        }
-
-        // FSE symbols: LL, ML, OF (read by decoder as OF, ML, LL).
-        fse_encode_one(fse_writer, ll_etable, ll_state,
-                       static_cast<std::uint8_t>(ll_code));
-        fse_encode_one(fse_writer, ml_etable, ml_state,
-                       static_cast<std::uint8_t>(ml_code));
-        fse_encode_one(fse_writer, of_etable, of_state,
-                       static_cast<std::uint8_t>(of_code));
+    // Last sequence: its FSE symbols live in the initial states; only its
+    // extra bits are written here.
+    {
+        const Seq& s = seqs[static_cast<std::size_t>(n - 1)];
+        Code lc = lit_len_code(s.lit_len);
+        Code mc = match_len_code(s.match_len);
+        Code oc = offset_code(s.match_dist);
+        ml_state = fse_init_cstate2(ml, mc.code);
+        of_state = fse_init_cstate2(of, oc.code);
+        ll_state = fse_init_cstate2(ll, lc.code);
+        if (lc.extra_bits) w.put_bits(static_cast<std::uint32_t>(lc.extra_val), lc.extra_bits);
+        if (mc.extra_bits) w.put_bits(static_cast<std::uint32_t>(mc.extra_val), mc.extra_bits);
+        if (oc.extra_bits) w.put_bits(static_cast<std::uint32_t>(oc.extra_val), oc.extra_bits);
     }
+    for (int i = n - 2; i >= 0; --i) {
+        const Seq& s = seqs[static_cast<std::size_t>(i)];
+        Code lc = lit_len_code(s.lit_len);
+        Code mc = match_len_code(s.match_len);
+        Code oc = offset_code(s.match_dist);
+        fse_encode_symbol(w, of, of_state, oc.code);
+        fse_encode_symbol(w, ml, ml_state, mc.code);
+        fse_encode_symbol(w, ll, ll_state, lc.code);
+        if (lc.extra_bits) w.put_bits(static_cast<std::uint32_t>(lc.extra_val), lc.extra_bits);
+        if (mc.extra_bits) w.put_bits(static_cast<std::uint32_t>(mc.extra_val), mc.extra_bits);
+        if (oc.extra_bits) w.put_bits(static_cast<std::uint32_t>(oc.extra_val), oc.extra_bits);
+    }
+    fse_flush_cstate(w, ml, ml_state);
+    fse_flush_cstate(w, of, of_state);
+    fse_flush_cstate(w, ll, ll_state);
+    w.put_bit(true);
+    w.align_to_byte();
+    const auto& bytes = w.data();
+    out.insert(out.end(), bytes.begin(), bytes.end());
+}
 
-    // Flush states: OF(5), ML(6), LL(6).
-    fse_flush_state(fse_writer, of_etable, of_state);
-    fse_flush_state(fse_writer, ml_etable, ml_state);
-    fse_flush_state(fse_writer, ll_etable, ll_state);
-
-    // Sentinel: a single 1-bit, then zero-pad to byte boundary.
-    // The decoder finds this 1-bit when reading backward from the end.
-    fse_writer.put_bit(true);
-    fse_writer.align_to_byte();
-
-    // Write FSE bitstream.
-    auto& fse_data = fse_writer.data();
-    output.insert(output.end(), fse_data.begin(), fse_data.end());
+// Build the content of a compressed block. Returns false if the block cannot
+// be represented as a compressed block (should fall back to a raw block).
+auto build_compressed_block(const std::uint8_t* data, std::size_t size,
+                            int effort, std::vector<std::byte>& out) -> bool {
+    std::vector<std::uint8_t> literals;
+    std::vector<Seq> seqs = build_sequences(data, size, effort, literals);
+    if (seqs.empty()) return false;  // nothing to gain from a compressed block
+    out.clear();
+    emit_raw_literals(out, literals);
+    emit_sequences(out, seqs);
+    return out.size() < size;
 }
 
 }  // namespace
@@ -338,61 +303,71 @@ auto compress(std::span<const std::byte> data, int level,
     if (data.empty()) return {};
     if (level < 1) level = 1;
     if (level > 22) level = 22;
+    // Map zstd level to a match-finder effort.
+    int effort = 1 << std::min(level, 12);
 
     std::size_t size = data.size();
 
-    // Raw-block compressor (type 0). The FSE-based compressed block encoder
-    // is implemented but the reverse-bitstream FSE encoding produces
-    // incorrect output for sequences — the encode/decode round-trip fails
-    // on non-trivial inputs. Using raw blocks ensures correct round-trip.
-    // TODO: fix FSE encoding for compressed blocks.
     std::vector<std::byte> output;
-
     std::uint32_t magic = 0xFD2FB528u;
     output.insert(output.end(), reinterpret_cast<std::byte*>(&magic),
                   reinterpret_cast<std::byte*>(&magic) + 4);
 
     int fcs_size;
     std::uint8_t fcs_code;
+    std::uint64_t fcs_value;
     if (size < 256) {
-        fcs_code = 0; fcs_size = 1;
-    } else if (size < 65536) {
-        fcs_code = 1; fcs_size = 2;
+        fcs_code = 0; fcs_size = 1; fcs_value = size;
+    } else if (size < 256 + 65536) {
+        // A 2-byte Frame_Content_Size stores the value minus 256.
+        fcs_code = 1; fcs_size = 2; fcs_value = size - 256;
     } else if (size < (1ULL << 32)) {
-        fcs_code = 2; fcs_size = 4;
+        fcs_code = 2; fcs_size = 4; fcs_value = size;
     } else {
-        fcs_code = 3; fcs_size = 8;
+        fcs_code = 3; fcs_size = 8; fcs_value = size;
     }
     bool single_seg = (fcs_code == 0);
     std::uint8_t desc = static_cast<std::uint8_t>(
         (1 << 2) | (single_seg ? (1 << 5) : 0) | (fcs_code << 6));
     output.push_back(static_cast<std::byte>(desc));
     if (!single_seg) {
-        output.push_back(static_cast<std::byte>(40));
+        output.push_back(static_cast<std::byte>(56));  // window = 128 KiB
     }
     for (int i = 0; i < fcs_size; ++i) {
-        output.push_back(static_cast<std::byte>((size >> (8 * i)) & 0xFF));
+        output.push_back(static_cast<std::byte>((fcs_value >> (8 * i)) & 0xFF));
     }
 
-    const std::byte* p = data.data();
-    std::size_t remaining = size;
-    while (remaining > 0) {
-        std::uint32_t blk_sz = static_cast<std::uint32_t>(
-            std::min(remaining, std::size_t{128 * 1024}));
-        bool last = (remaining <= 128 * 1024);
-        remaining -= blk_sz;
-        std::uint32_t blk_hdr = (last ? 1u : 0u) | (0u << 1) | (blk_sz << 3);
+    const auto* p = reinterpret_cast<const std::uint8_t*>(data.data());
+    std::size_t off = 0;
+    while (off < size) {        std::size_t blen = std::min<std::size_t>(kBlockSize, size - off);
+        bool last = (off + blen == size);
+
+        std::vector<std::byte> content;
+        bool compressed = build_compressed_block(p + off, blen, effort, content);
+        const std::vector<std::byte>* payload;
+        std::vector<std::byte> raw;
+        if (compressed) {
+            payload = &content;
+        } else {
+            raw.assign(reinterpret_cast<const std::byte*>(p + off),
+                       reinterpret_cast<const std::byte*>(p + off) + blen);
+            payload = &raw;
+        }
+
+        std::uint32_t type = compressed ? 2u : 0u;
+        std::uint32_t cs = static_cast<std::uint32_t>(payload->size());
+        std::uint32_t blk_hdr = (last ? 1u : 0u) | (type << 1) | (cs << 3);
         output.push_back(static_cast<std::byte>(blk_hdr & 0xFF));
         output.push_back(static_cast<std::byte>((blk_hdr >> 8) & 0xFF));
         output.push_back(static_cast<std::byte>((blk_hdr >> 16) & 0xFF));
-        output.insert(output.end(), p, p + blk_sz);
-        p += blk_sz;
+        output.insert(output.end(), payload->begin(), payload->end());
+        off += blen;
     }
 
     std::uint64_t checksum = xxhash64(data);
-    std::uint32_t cs = static_cast<std::uint32_t>(checksum);
-    output.insert(output.end(), reinterpret_cast<std::byte*>(&cs),
-                  reinterpret_cast<std::byte*>(&cs) + 4);
+    std::uint32_t csum = static_cast<std::uint32_t>(checksum);
+    output.insert(output.end(), reinterpret_cast<std::byte*>(&csum),
+                  reinterpret_cast<std::byte*>(&csum) + 4);
 
     if (output.size() >= size) return {};
     return output;

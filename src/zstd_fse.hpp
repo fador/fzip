@@ -145,4 +145,35 @@ void fse_flush_state(FseBitWriter& writer, const FseEncodeTable& table,
 void write_fse_table_description(FseBitWriter& writer, int accuracy_log,
                                  const int* norm_counts, int max_symbol);
 
+// --- Spec-correct FSE encoder (zstd v1.5.7 algorithm) ---
+//
+// `FseCTable` mirrors the reference FSE_CTable: a per-symbol transform plus a
+// state-transition table. It is built from a normalized distribution that may
+// contain -1 entries ("less than 1" probability), exactly like the predefined
+// zstd distributions.
+struct FseCTable {
+    int table_log = 0;
+    int table_size = 0;
+    std::vector<std::uint16_t> state_table;      // size = table_size
+    std::vector<std::int32_t> delta_find_state;  // per symbol
+    std::vector<std::uint32_t> delta_nb_bits;    // per symbol
+};
+
+// Build an encode table from a normalized distribution (sum = 1<<table_log,
+// values in {-1,0,1,...}). `norm` must have (max_symbol+1) entries.
+auto build_fse_ctable(int table_log, const std::int16_t* norm, int max_symbol)
+    -> FseCTable;
+
+// FSE_initCState2: initialize a state with `symbol` (the first symbol the
+// encoder emits, which is the last one the decoder reads).
+auto fse_init_cstate2(const FseCTable& ct, int symbol) -> std::uint32_t;
+
+// FSE_encodeSymbol: emit `symbol` from `value` and advance the state.
+void fse_encode_symbol(FseBitWriter& w, const FseCTable& ct,
+                       std::uint32_t& value, int symbol);
+
+// FSE_flushCState: emit the final state (the decoder's initial state).
+void fse_flush_cstate(FseBitWriter& w, const FseCTable& ct,
+                      std::uint32_t value);
+
 }  // namespace fzip::zstd

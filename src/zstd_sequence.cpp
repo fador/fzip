@@ -79,61 +79,42 @@ auto offset_code_to_base(int code) -> int {
 
 auto decode_sequences(const std::byte* data, std::size_t size,
                       int num_sequences,
-                      const FseTable& litlen_table,
-                      const FseTable& offset_table,
-                      const FseTable& matchlen_table) -> std::vector<Sequence> {
+                      const FseSeqSymbol* litlen_table,
+                      const FseSeqSymbol* offset_table,
+                      const FseSeqSymbol* matchlen_table)
+    -> std::vector<Sequence> {
     if (num_sequences == 0) return {};
 
     // The FSE bitstream is written forward, read backward from the end.
     FseBitReader reader(data, size);
 
-    // Read initial states (accuracy_log bits each, from the end of the stream).
-    std::uint32_t ll_state = reader.get_state(litlen_table.accuracy_log);
-    std::uint32_t ml_state = reader.get_state(matchlen_table.accuracy_log);
-    std::uint32_t of_state = reader.get_state(offset_table.accuracy_log);
+    // Initial states, read (backward) in order: literals length, offset,
+    // match length.
+    std::uint32_t ll_state = reader.get_state(6);
+    std::uint32_t of_state = reader.get_state(5);
+    std::uint32_t ml_state = reader.get_state(6);
 
     std::vector<Sequence> seqs;
-    seqs.reserve(num_sequences);
+    seqs.reserve(static_cast<std::size_t>(num_sequences));
     for (int i = 0; i < num_sequences; ++i) {
-        if (reader.empty()) break;
+        const FseSeqSymbol& ll = litlen_table[ll_state];
+        const FseSeqSymbol& ml = matchlen_table[ml_state];
+        const FseSeqSymbol& of = offset_table[of_state];
 
-        // Decode order (reverse of output order): offset, matchlen, litlen.
-        int offset_code = fse_decode_one(offset_table, reader, of_state);
-        int matchlen_code = fse_decode_one(matchlen_table, reader, ml_state);
-        int litlen_code = fse_decode_one(litlen_table, reader, ll_state);
-
-        // Safety: cap decoded values to prevent hangs.
-        if (offset_code > 31) offset_code = 0;
-        if (matchlen_code > 52) matchlen_code = 0;
-        if (litlen_code > 35) litlen_code = 0;
-
-        // Resolve offset code to actual offset.
-        // Codes 0-3: repeat offsets (stored as negative values for execute_sequences).
-        // Codes 4+: actual distance.
-        int offset;
-        if (offset_code <= 3) {
-            // Store as -(code+1) so execute_sequences can distinguish repeat codes.
-            offset = -(offset_code + 1);
-        } else {
-            int num_extra = offset_code - 2;  // reference formula
-            int base = (1 << (offset_code - 2)) + 1;
-            int extra = 0;
-            if (num_extra > 0) {
-                extra = static_cast<int>(reader.read_bits(num_extra));
-            }
-            offset = base + extra;
+        // Decoder consumes: offset extra, match-len extra, lit-len extra,
+        // then updates states LL, ML, OF.
+        if (of.nb_add_bits <= 1) {
+            throw ZstdError("repeat offset codes are not supported");
         }
-
-        int match_len = matchlen_code_to_base(matchlen_code);
-        int ml_extra = matchlen_code_to_extra(matchlen_code);
-        if (ml_extra > 0) {
-            match_len += static_cast<int>(reader.read_bits(ml_extra));
+        int offset = static_cast<int>(of.base_value) +
+                     static_cast<int>(reader.read_bits(of.nb_add_bits));
+        int match_len = static_cast<int>(ml.base_value);
+        if (ml.nb_add_bits) {
+            match_len += static_cast<int>(reader.read_bits(ml.nb_add_bits));
         }
-
-        int lit_len = litlen_code_to_base(litlen_code);
-        int ll_extra = litlen_code_to_extra(litlen_code);
-        if (ll_extra > 0) {
-            lit_len += static_cast<int>(reader.read_bits(ll_extra));
+        int lit_len = static_cast<int>(ll.base_value);
+        if (ll.nb_add_bits) {
+            lit_len += static_cast<int>(reader.read_bits(ll.nb_add_bits));
         }
 
         Sequence seq;
@@ -141,6 +122,12 @@ auto decode_sequences(const std::byte* data, std::size_t size,
         seq.match_length = match_len;
         seq.offset = offset;
         seqs.push_back(seq);
+
+        if (i + 1 < num_sequences) {
+            ll_state = ll.next_state + reader.read_bits(ll.nb_bits);
+            ml_state = ml.next_state + reader.read_bits(ml.nb_bits);
+            of_state = of.next_state + reader.read_bits(of.nb_bits);
+        }
     }
 
     return seqs;
@@ -216,6 +203,12 @@ auto execute_sequences(const std::vector<Sequence>& sequences,
                 out.push_back(out[src + static_cast<std::size_t>(j)]);
             }
         }
+    }
+
+    // Literals remaining after the last sequence are appended verbatim
+    // (RFC 8878 §4.2.5, "Sequence Execution").
+    if (lit_pos < static_cast<int>(literals.size())) {
+        out.insert(out.end(), literals.begin() + lit_pos, literals.end());
     }
 
     return out;
