@@ -76,14 +76,14 @@ Synthetic corpus: 9 files (text/binary/mixed at 4K/64K/256K each, ~972 KB).
 ```
 Config                  Size   Ratio  Compress   Decompress
 --------------------------------------------------------------
-fzip store          1008.8 KB   0.964 58.2 MB/s   53.8 MB/s
-fzip deflate-6       661.5 KB   1.469 10.3 MB/s   30.0 MB/s
-fzip deflate-9       661.4 KB   1.470  8.3 MB/s   28.6 MB/s
-fzip auto            661.4 KB   1.470  9.7 MB/s   29.2 MB/s
+fzip store          1008.8 KB   0.964 52.8 MB/s   47.9 MB/s
+fzip deflate-6       661.5 KB   1.469 18.7 MB/s   27.7 MB/s
+fzip deflate-9       661.4 KB   1.470 16.9 MB/s   28.6 MB/s
+fzip auto            661.4 KB   1.470 17.4 MB/s   29.2 MB/s
 fzip zstd (raw)     1008.8 KB   0.964 57.2 MB/s   52.4 MB/s
-7za deflate-5        643.0 KB   1.512 10.6 MB/s   32.0 MB/s
-7za deflate-9        640.1 KB   1.518  2.8 MB/s   33.5 MB/s
-7za LZMA-9           632.9 KB   1.536 11.5 MB/s   22.7 MB/s
+7za deflate-5        643.0 KB   1.512 10.4 MB/s   32.6 MB/s
+7za deflate-9        640.1 KB   1.518  2.9 MB/s   31.4 MB/s
+7za LZMA-9           632.9 KB   1.536 11.5 MB/s   23.4 MB/s
 ```
 
 The synthetic corpus is dominated by near-incompressible mixed data, so it
@@ -96,6 +96,11 @@ Input                 Before     After   Change
 7za.exe (PE, 1.3 MB)  728422    681527   -6.4%
 fzip source (231 KB)   59749     58117   -2.7%
 ```
+
+Compression throughput improved ~2x because entries are now compressed in
+parallel across CPU cores (written in order, so output is deterministic).
+A 1000-file / 18 MB archive compresses ~4.7x faster than the sequential
+path.
 
 Extraction speed also improved substantially: the Huffman inflate now uses
 an O(1) canonical lookup table (was an O(symbols) scan per bit), CRC-32 uses
