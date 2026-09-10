@@ -113,7 +113,9 @@ A 1000-file / 18 MB archive compresses ~4.7x faster than the sequential
 path. Blocks within a single file are also compressed in parallel for both
 codecs — zstd blocks are independent, and deflate tokenizes a wave of blocks
 then emits them sequentially. A 13 MB file went from ~35 s to ~2.5 s at
-zstd-19, and from 3.27 s to 0.74 s at deflate-9.
+zstd-19, and from 3.27 s to 0.74 s at deflate-9. Decompression is threaded
+too: entries extract in parallel and zstd blocks decode in parallel (13 MB
+extracts in ~0.07 s).
 
 Extraction speed also improved substantially: the Huffman inflate now uses
 an O(1) canonical lookup table (was an O(symbols) scan per bit), CRC-32 uses
