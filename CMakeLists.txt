@@ -46,6 +46,10 @@ add_executable(fzip
 target_include_directories(fzip PRIVATE src)
 target_compile_features(fzip PRIVATE cxx_std_20)
 
+# Per-file compression runs on a thread pool.
+find_package(Threads REQUIRED)
+target_link_libraries(fzip PRIVATE Threads::Threads)
+
 # --- Tests ------------------------------------------------------------------
 enable_testing()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
