@@ -20,8 +20,10 @@ A state-of-the-art ZIP compressor in C++20, built to benchmark against
     FSE encoder and LZ77 match finder are implemented but the reverse-
     bitstream FSE encoding for compressed blocks needs further work.
 - **Per-file codec selection** based on magic-byte type detection:
-  incompressible → Store, executables → zstd-19, text → zstd-22,
-  general binary → deflate-6.
+  incompressible → Store, executables → deflate-9, text → deflate-9,
+  general binary → deflate-6. (The executable/text branches temporarily
+  fall back to deflate because the custom zstd compressor still only emits
+  raw blocks; deflate is a strict improvement over the Store fallback.)
 
 ## Why custom zstd?
 
@@ -73,12 +75,25 @@ Synthetic corpus: 9 files (text/binary/mixed at 4K/64K/256K each, ~972 KB).
 
 ```
 Config                  Size   Ratio  Compress   Decompress
----------------------------------------------------------------
-fzip deflate-6       661.6 KB   1.469 11.9 MB/s    1.1 MB/s
-fzip zstd (raw)     1008.8 KB   0.964  9.4 MB/s   28.0 MB/s
-7za deflate-5        643.0 KB   1.512  9.3 MB/s   28.1 MB/s
-7za deflate-9        640.1 KB   1.518  2.8 MB/s   28.0 MB/s
-7za LZMA-9           632.9 KB   1.536 10.4 MB/s   19.9 MB/s
+--------------------------------------------------------------
+fzip deflate-6       661.5 KB   1.469 10.2 MB/s    1.1 MB/s
+fzip deflate-9       661.4 KB   1.470  8.2 MB/s    1.1 MB/s
+fzip auto            661.4 KB   1.470  9.5 MB/s    1.1 MB/s
+fzip zstd (raw)     1008.8 KB   0.964 50.0 MB/s   33.0 MB/s
+7za deflate-5        643.0 KB   1.512 10.5 MB/s   28.6 MB/s
+7za deflate-9        640.1 KB   1.518  2.8 MB/s   31.0 MB/s
+7za LZMA-9           632.9 KB   1.536 10.2 MB/s   20.3 MB/s
+```
+
+The synthetic corpus is dominated by near-incompressible mixed data, so it
+understates the deflate improvements. On realistic inputs the lazy matcher
+pays off clearly (raw-DEFLATE size, level 6):
+
+```
+Input                 Before     After   Change
+-------------------------------------------------
+7za.exe (PE, 1.3 MB)  728422    681527   -6.4%
+fzip source (231 KB)   59749     58117   -2.7%
 ```
 
 Note: The custom zstd compressor currently uses raw blocks (no LZ77

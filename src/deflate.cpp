@@ -332,58 +332,59 @@ auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
         default: effort = 1 << 14; lazy = true; break;  // 9
     }
 
-    std::size_t pos = 0;
-    Token pending{false, 0, 0, 0};  // pending literal for lazy matching
-    bool have_pending = false;
+    auto emit_lit = [&](std::uint8_t c) {
+        Token t{false, c, 0, 0};
+        tokens.push_back(t);
+        lit_freq[c]++;
+    };
+    auto emit_match = [&](int len, int dist) {
+        Token t{true, 0, len, dist};
+        tokens.push_back(t);
+        lit_freq[257 + length_to_symbol(len)]++;
+        dist_freq[distance_to_symbol(dist)]++;
+    };
 
+    std::size_t pos = 0;
     while (pos < size) {
         Match m = find_match(data, size, pos, head, prev, effort);
-        if (m.len >= kMinMatch) {
-            if (have_pending) {
-                // Compare: if matching at pos beats the pending literal,
-                // flush pending as literal and take this match; else flush
-                // pending as a match (lazy).
-                tokens.push_back(pending);
-                lit_freq[pending.lit]++;
-                have_pending = false;
+        if (m.len < kMinMatch) {
+            emit_lit(data[pos]);
+            insert_hash(data, size, pos, head, prev);
+            ++pos;
+            continue;
+        }
+
+        if (lazy) {
+            // Insert pos, then look one byte ahead for a longer match. If the
+            // next position yields a longer match, emit a literal here and take
+            // that match instead (classic lazy matching, deflate_slow-style).
+            insert_hash(data, size, pos, head, prev);
+            Match m2 = find_match(data, size, pos + 1, head, prev, effort);
+            if (m2.len > m.len) {
+                emit_lit(data[pos]);
+                ++pos;
+                m = m2;
+                emit_match(m.len, m.dist);
+                for (int i = 0; i < m.len; ++i) {
+                    insert_hash(data, size, pos + i, head, prev);
+                }
+                pos += m.len;
+                continue;
             }
-            // Emit match token.
-            Token t{true, 0, m.len, m.dist};
-            tokens.push_back(t);
-            // Update hash chains for all positions in the match.
-            for (int i = 0; i < m.len; ++i) {
+            // Keep the match at pos; pos was already inserted above.
+            emit_match(m.len, m.dist);
+            for (int i = 1; i < m.len; ++i) {
                 insert_hash(data, size, pos + i, head, prev);
             }
-            // Update frequencies for the encoded length/distance symbols.
-            // Length symbol (RFC 1951 §3.2.5):
-            int len_sym = length_to_symbol(m.len);
-            lit_freq[257 + len_sym]++;
-            int dist_sym = distance_to_symbol(m.dist);
-            dist_freq[dist_sym]++;
             pos += m.len;
-        } else {
-            // Literal.
-            if (lazy && have_pending) {
-                // Flush previous pending literal.
-                tokens.push_back(pending);
-                lit_freq[pending.lit]++;
-                have_pending = false;
-            }
-            Token t{false, data[pos], 0, 0};
-            if (lazy) {
-                pending = t;
-                have_pending = true;
-            } else {
-                tokens.push_back(t);
-                lit_freq[t.lit]++;
-            }
-            insert_hash(data, size, pos, head, prev);
-            pos++;
+            continue;
         }
-    }
-    if (have_pending) {
-        tokens.push_back(pending);
-        lit_freq[pending.lit]++;
+
+        emit_match(m.len, m.dist);
+        for (int i = 0; i < m.len; ++i) {
+            insert_hash(data, size, pos + i, head, prev);
+        }
+        pos += m.len;
     }
     // End-of-block symbol (256) frequency = 1.
     lit_freq[256]++;

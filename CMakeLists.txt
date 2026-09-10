@@ -67,3 +67,13 @@ add_test(NAME stage3_deflate
             --stage 3 --binary $<TARGET_FILE:fzip>
             --workdir ${CMAKE_BINARY_DIR}/test_tmp3)
 set_tests_properties(stage3_deflate PROPERTIES TIMEOUT 60)
+add_test(NAME stage4_zstd
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/verify.py
+            --stage 4 --binary $<TARGET_FILE:fzip>
+            --workdir ${CMAKE_BINARY_DIR}/test_tmp4)
+set_tests_properties(stage4_zstd PROPERTIES TIMEOUT 60)
+add_test(NAME stage5_auto
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/verify.py
+            --stage 5 --binary $<TARGET_FILE:fzip>
+            --workdir ${CMAKE_BINARY_DIR}/test_tmp5)
+set_tests_properties(stage5_auto PROPERTIES TIMEOUT 60)
