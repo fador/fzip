@@ -238,6 +238,81 @@ auto decode_literals(const std::byte* data, std::size_t size,
     throw ZstdError("treeless literals block not supported");
 }
 
+// Map a sequence code to its (base, extra-bits) for a given stream kind:
+// 0 = literals length, 1 = offset, 2 = match length.
+void seq_code_base_extra(int kind, int code, int& base, int& extra) {
+    if (kind == 0) {
+        base = litlen_code_to_base(code);
+        extra = litlen_code_to_extra(code);
+    } else if (kind == 1) {
+        // Offset: offset = ((1<<code)-3) + read(code) for code >= 2.
+        base = (code >= 2) ? static_cast<int>((1u << code) - 3u) : 0;
+        extra = (code >= 2) ? code : 0;
+    } else {
+        base = matchlen_code_to_base(code);
+        extra = matchlen_code_to_extra(code);
+    }
+}
+
+// A sequence FSE table resolved for decoding.
+struct ResolvedSeqTable {
+    std::vector<FseSeqSymbol> storage;
+    const FseSeqSymbol* table = nullptr;
+    int acc = 0;
+};
+
+// Parse one stream's table (predefined / RLE / inline FSE), advancing `p`.
+void build_seq_table(int mode, int kind, const std::byte*& p,
+                     const std::byte* end, ResolvedSeqTable& out) {
+    if (mode == 0) {  // predefined
+        if (kind == 0) {
+            out.table = kLLDefaultDTable;
+            out.acc = 6;
+        } else if (kind == 1) {
+            out.table = kOFDefaultDTable;
+            out.acc = 5;
+        } else {
+            out.table = kMLDefaultDTable;
+            out.acc = 6;
+        }
+        return;
+    }
+    if (mode == 1) {  // RLE: one symbol byte
+        if (p >= end) throw ZstdError("rle sequence table truncated");
+        int code = static_cast<std::uint8_t>(*p++);
+        int base, extra;
+        seq_code_base_extra(kind, code, base, extra);
+        out.storage.resize(1);
+        out.storage[0] = {0, static_cast<std::uint8_t>(extra), 0,
+                          static_cast<std::uint32_t>(base)};
+        out.table = out.storage.data();
+        out.acc = 0;
+        return;
+    }
+    // mode 2: inline FSE table description.
+    int table_log = 0;
+    int max_symbol = 0;
+    std::vector<int> norm;
+    std::size_t consumed = 0;
+    if (!fse_read_ncount(p, static_cast<std::size_t>(end - p), table_log, norm,
+                         max_symbol, consumed)) {
+        throw ZstdError("invalid sequence FSE table");
+    }
+    p += consumed;
+    FseDecodeTable dt;
+    build_fse_dtable(table_log, norm.data(), max_symbol, dt);
+    out.storage.resize(dt.symbol.size());
+    for (std::size_t u = 0; u < dt.symbol.size(); ++u) {
+        int code = dt.symbol[u];
+        int base, extra;
+        seq_code_base_extra(kind, code, base, extra);
+        out.storage[u] = {dt.next_state[u], static_cast<std::uint8_t>(extra),
+                          dt.nb_bits[u], static_cast<std::uint32_t>(base)};
+    }
+    out.table = out.storage.data();
+    out.acc = table_log;
+}
+
 // Decompress one compressed block.
 auto decompress_compressed_block(const std::byte* data, std::size_t size,
                                  [[maybe_unused]] const BlockHeader& hdr)
@@ -273,14 +348,17 @@ auto decompress_compressed_block(const std::byte* data, std::size_t size,
     int ll_mode = (modes >> 6) & 3;
     int of_mode = (modes >> 4) & 3;
     int ml_mode = (modes >> 2) & 3;
-    if (ll_mode != 0 || of_mode != 0 || ml_mode != 0) {
-        throw ZstdError("only predefined FSE tables are supported");
-    }
+
+    // Resolve each stream's FSE table (predefined / RLE / inline).
+    ResolvedSeqTable ll, of, ml;
+    build_seq_table(ll_mode, 0, p, end, ll);
+    build_seq_table(of_mode, 1, p, end, of);
+    build_seq_table(ml_mode, 2, p, end, ml);
 
     // Decode sequences from the remaining FSE bitstream.
     auto sequences = decode_sequences(p, static_cast<std::size_t>(end - p),
-                                      num_sequences, kLLDefaultDTable,
-                                      kOFDefaultDTable, kMLDefaultDTable);
+                                      num_sequences, ll.table, ll.acc, of.table,
+                                      of.acc, ml.table, ml.acc);
 
     // Execute sequences.
     RepeatOffsets repeat;

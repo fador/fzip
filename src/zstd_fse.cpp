@@ -993,4 +993,249 @@ void fse_flush_cstate(FseBitWriter& w, const FseCTable& ct, std::uint32_t value)
     w.put_bits(value, ct.table_log);
 }
 
+// ==========================================================================
+// Shared FSE table helpers (NCount + normalization + decode table).
+// ==========================================================================
+
+namespace {
+
+// Forward, LSB-first bit reader with lookahead (for the NCount description).
+struct FwdBits {
+    const std::uint8_t* d;
+    std::size_t n;
+    std::size_t pos = 0;
+    auto peek(int bits) const -> std::uint32_t {
+        std::uint32_t v = 0;
+        for (int i = 0; i < bits; ++i) {
+            std::size_t p = pos + static_cast<std::size_t>(i);
+            std::uint32_t b = (p < n * 8) ? ((d[p >> 3] >> (p & 7)) & 1u) : 0u;
+            v |= b << i;
+        }
+        return v;
+    }
+    void skip(int bits) { pos += static_cast<std::size_t>(bits); }
+};
+
+}
+
+void fse_normalize(const unsigned* freqs, int total, int max_symbol,
+                   int table_log, std::vector<int>& norm) {
+    const int table_size = 1 << table_log;
+    norm.assign(static_cast<std::size_t>(max_symbol) + 1, 0);
+    if (total <= 0) return;
+    long long sum = 0;
+    for (int s = 0; s <= max_symbol; ++s) {
+        if (freqs[s] > 0) {
+            long long v = (static_cast<long long>(freqs[s]) * table_size) / total;
+            if (v < 1) v = 1;
+            norm[static_cast<std::size_t>(s)] = static_cast<int>(v);
+            sum += v;
+        }
+    }
+    while (sum > table_size) {
+        int best = -1;
+        for (int s = 0; s <= max_symbol; ++s) {
+            if (norm[static_cast<std::size_t>(s)] > 1 &&
+                (best < 0 || norm[static_cast<std::size_t>(s)] >
+                                 norm[static_cast<std::size_t>(best)])) {
+                best = s;
+            }
+        }
+        if (best < 0) break;
+        norm[static_cast<std::size_t>(best)]--;
+        sum--;
+    }
+    while (sum < table_size) {
+        int best = 0;
+        for (int s = 1; s <= max_symbol; ++s) {
+            if (norm[static_cast<std::size_t>(s)] >
+                norm[static_cast<std::size_t>(best)]) {
+                best = s;
+            }
+        }
+        norm[static_cast<std::size_t>(best)]++;
+        sum++;
+    }
+}
+
+void fse_write_ncount(std::vector<std::byte>& out, const int* norm,
+                      int max_symbol, int table_log) {
+    const int table_size = 1 << table_log;
+    std::uint32_t bit_stream = 0;
+    int bit_count = 0;
+    auto flush = [&]() {
+        while (bit_count >= 8) {
+            out.push_back(static_cast<std::byte>(bit_stream & 0xFF));
+            bit_stream >>= 8;
+            bit_count -= 8;
+        }
+    };
+    auto put = [&](std::uint32_t v, int bits) {
+        bit_stream |= (v & ((1u << bits) - 1u)) << bit_count;
+        bit_count += bits;
+        flush();
+    };
+
+    put(static_cast<std::uint32_t>(table_log - 5), 4);
+    int remaining = table_size + 1;
+    int threshold = table_size;
+    int nb_bits = table_log + 1;
+    unsigned symbol = 0;
+    const unsigned alphabet = static_cast<unsigned>(max_symbol) + 1;
+    int previous_is0 = 0;
+    while (symbol < alphabet && remaining > 1) {
+        if (previous_is0) {
+            unsigned start = symbol;
+            while (symbol < alphabet && norm[symbol] == 0) ++symbol;
+            if (symbol == alphabet) break;
+            while (symbol >= start + 24) {
+                start += 24;
+                put(0xFFFF, 16);
+            }
+            while (symbol >= start + 3) {
+                start += 3;
+                put(3, 2);
+            }
+            put(symbol - start, 2);
+            previous_is0 = 0;
+        }
+        int count = norm[symbol++];
+        int max = (2 * threshold - 1) - remaining;
+        remaining -= (count < 0 ? -count : count);
+        count++;
+        if (count >= threshold) count += max;
+        int width = nb_bits - (count < max ? 1 : 0);
+        put(static_cast<std::uint32_t>(count), width);
+        previous_is0 = (count == 1);
+        while (remaining < threshold) {
+            nb_bits--;
+            threshold >>= 1;
+        }
+    }
+    while (bit_count > 0) {
+        out.push_back(static_cast<std::byte>(bit_stream & 0xFF));
+        bit_stream >>= 8;
+        bit_count -= 8;
+    }
+}
+
+auto fse_read_ncount(const std::byte* data, std::size_t size, int& table_log,
+                     std::vector<int>& norm, int& max_symbol,
+                     std::size_t& consumed) -> bool {
+    if (size < 1) return false;
+    FwdBits r{reinterpret_cast<const std::uint8_t*>(data), size};
+    int nb = static_cast<int>(r.peek(4)) + 5;
+    r.skip(4);
+    if (nb > 12) return false;
+    table_log = nb;
+    int remaining = (1 << nb) + 1;
+    int threshold = 1 << nb;
+    int nb_bits = nb + 1;
+    std::vector<int> counts(256, 0);
+    int charnum = 0;
+    int previous0 = 0;
+    while (true) {
+        if (previous0) {
+            int repeats = 0;
+            while (r.peek(2) == 3) {
+                repeats += 3;
+                r.skip(2);
+            }
+            int final_code = static_cast<int>(r.peek(2));
+            r.skip(2);
+            charnum += repeats + final_code;
+            if (charnum >= 256) break;
+            previous0 = 0;
+        }
+        int max = (2 * threshold - 1) - remaining;
+        int count;
+        if (static_cast<int>(r.peek(nb_bits - 1)) < max) {
+            count = static_cast<int>(r.peek(nb_bits - 1));
+            r.skip(nb_bits - 1);
+        } else {
+            int v = static_cast<int>(r.peek(nb_bits)) & (2 * threshold - 1);
+            count = v;
+            if (count >= threshold) count -= max;
+            r.skip(nb_bits);
+        }
+        count--;
+        remaining -= (count < 0 ? -count : count);
+        counts[static_cast<std::size_t>(charnum++)] = count;
+        previous0 = (count == 0);
+        if (remaining < threshold) {
+            if (remaining <= 1) break;
+            nb_bits = highbit(static_cast<std::uint32_t>(remaining)) + 1;
+            threshold = 1 << (nb_bits - 1);
+        }
+        if (charnum >= 256) break;
+    }
+    if (remaining != 1) return false;
+    max_symbol = charnum - 1;
+    if (max_symbol < 0) return false;
+    norm.assign(counts.begin(), counts.begin() + max_symbol + 1);
+    consumed = (r.pos + 7) / 8;
+    return true;
+}
+
+void build_fse_dtable(int table_log, const int* norm, int max_symbol,
+                      FseDecodeTable& dt) {
+    const int table_size = 1 << table_log;
+    const int mask = table_size - 1;
+    const int step = (table_size >> 1) + (table_size >> 3) + 3;
+    std::vector<int> symbol_next(static_cast<std::size_t>(max_symbol) + 1, 0);
+    std::vector<std::uint8_t> spread(static_cast<std::size_t>(table_size), 0);
+    int high_threshold = table_size - 1;
+    for (int s = 0; s <= max_symbol; ++s) {
+        int n = norm[s];
+        if (n == -1) {
+            spread[static_cast<std::size_t>(high_threshold--)] =
+                static_cast<std::uint8_t>(s);
+            symbol_next[static_cast<std::size_t>(s)] = 1;
+        } else {
+            symbol_next[static_cast<std::size_t>(s)] = n;
+        }
+    }
+    if (high_threshold == table_size - 1) {
+        std::vector<std::uint8_t> flat(static_cast<std::size_t>(table_size), 0);
+        int pos = 0;
+        for (int s = 0; s <= max_symbol; ++s) {
+            for (int i = 0; i < norm[s]; ++i) {
+                flat[static_cast<std::size_t>(pos++)] =
+                    static_cast<std::uint8_t>(s);
+            }
+        }
+        int position = 0;
+        for (int i = 0; i < table_size; ++i) {
+            spread[static_cast<std::size_t>(position) & mask] =
+                flat[static_cast<std::size_t>(i)];
+            position = (position + step) & mask;
+        }
+    } else {
+        int position = 0;
+        for (int s = 0; s <= max_symbol; ++s) {
+            for (int i = 0; i < norm[s]; ++i) {
+                spread[static_cast<std::size_t>(position)] =
+                    static_cast<std::uint8_t>(s);
+                position = (position + step) & mask;
+                while (position > high_threshold) {
+                    position = (position + step) & mask;
+                }
+            }
+        }
+    }
+    dt.table_log = table_log;
+    dt.symbol.assign(static_cast<std::size_t>(table_size), 0);
+    dt.nb_bits.assign(static_cast<std::size_t>(table_size), 0);
+    dt.next_state.assign(static_cast<std::size_t>(table_size), 0);
+    for (int u = 0; u < table_size; ++u) {
+        int s = spread[static_cast<std::size_t>(u)];
+        int ns = symbol_next[static_cast<std::size_t>(s)]++;
+        int nb = table_log - highbit(static_cast<std::uint32_t>(ns));
+        dt.symbol[static_cast<std::size_t>(u)] = static_cast<std::uint8_t>(s);
+        dt.nb_bits[static_cast<std::size_t>(u)] = static_cast<std::uint8_t>(nb);
+        dt.next_state[static_cast<std::size_t>(u)] =
+            static_cast<std::uint16_t>((ns << nb) - table_size);
+    }
+}
+
 }  // namespace fzip::zstd

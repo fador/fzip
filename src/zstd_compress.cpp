@@ -284,6 +284,61 @@ void emit_literals(std::vector<std::byte>& out,
     for (std::uint8_t b : lits) out.push_back(static_cast<std::byte>(b));
 }
 
+// A per-stream sequence FSE table and its symbol-compression mode.
+struct SeqStream {
+    int mode = 0;  // 0 predefined, 1 RLE, 2 FSE
+    int rle_sym = 0;
+    FseCTable ct;
+    std::vector<std::byte> desc;  // NCount table description (mode 2)
+};
+
+auto make_seq_stream(const int* freq, int max_code, int max_log, int n,
+                     const FseCTable& predef) -> SeqStream {
+    SeqStream s;
+    int present = 0;
+    int only = 0;
+    for (int c = 0; c <= max_code; ++c) {
+        if (freq[c] > 0) {
+            ++present;
+            only = c;
+        }
+    }
+    if (present <= 1) {
+        s.mode = 1;  // RLE
+        s.rle_sym = only;
+        return s;
+    }
+    if (n < 32) {
+        s.mode = 0;  // predefined (table description would cost more)
+        s.ct = predef;
+        return s;
+    }
+    s.mode = 2;  // inline FSE table
+    std::vector<unsigned> counts(static_cast<std::size_t>(max_code) + 1);
+    for (int c = 0; c <= max_code; ++c) {
+        counts[static_cast<std::size_t>(c)] =
+            static_cast<unsigned>(freq[c]);
+    }
+    std::vector<int> norm;
+    fse_normalize(counts.data(), n, max_code, max_log, norm);
+    std::vector<std::int16_t> norm16(static_cast<std::size_t>(max_code) + 1);
+    for (int c = 0; c <= max_code; ++c) {
+        norm16[static_cast<std::size_t>(c)] =
+            static_cast<std::int16_t>(norm[static_cast<std::size_t>(c)]);
+    }
+    s.ct = build_fse_ctable(max_log, norm16.data(), max_code);
+    fse_write_ncount(s.desc, norm.data(), max_code, max_log);
+    return s;
+}
+
+void emit_seq_table(std::vector<std::byte>& out, const SeqStream& s) {
+    if (s.mode == 1) {
+        out.push_back(static_cast<std::byte>(s.rle_sym));
+    } else if (s.mode == 2) {
+        out.insert(out.end(), s.desc.begin(), s.desc.end());
+    }
+}
+
 void emit_sequences(std::vector<std::byte>& out, const std::vector<Seq>& seqs) {
     const int n = static_cast<int>(seqs.size());
     if (n == 0) {
@@ -302,12 +357,33 @@ void emit_sequences(std::vector<std::byte>& out, const std::vector<Seq>& seqs) {
         out.push_back(static_cast<std::byte>(v & 0xFF));
         out.push_back(static_cast<std::byte>((v >> 8) & 0xFF));
     }
-    // Symbol compression modes: all predefined (0).
-    out.push_back(std::byte{0});
 
-    const FseCTable& ll = ll_ctable();
-    const FseCTable& of = of_ctable();
-    const FseCTable& ml = ml_ctable();
+    // Precompute codes and per-block frequencies.
+    std::vector<int> llc(static_cast<std::size_t>(n));
+    std::vector<int> ofc(static_cast<std::size_t>(n));
+    std::vector<int> mlc(static_cast<std::size_t>(n));
+    int ll_freq[36] = {0};
+    int of_freq[32] = {0};
+    int ml_freq[53] = {0};
+    for (int i = 0; i < n; ++i) {
+        const Seq& s = seqs[static_cast<std::size_t>(i)];
+        llc[static_cast<std::size_t>(i)] = lit_len_code(s.lit_len).code;
+        ofc[static_cast<std::size_t>(i)] = offset_code(s.match_dist).code;
+        mlc[static_cast<std::size_t>(i)] = match_len_code(s.match_len).code;
+        ll_freq[llc[static_cast<std::size_t>(i)]]++;
+        of_freq[ofc[static_cast<std::size_t>(i)]]++;
+        ml_freq[mlc[static_cast<std::size_t>(i)]]++;
+    }
+    SeqStream ll = make_seq_stream(ll_freq, 35, 9, n, ll_ctable());
+    SeqStream of = make_seq_stream(of_freq, 31, 8, n, of_ctable());
+    SeqStream ml = make_seq_stream(ml_freq, 52, 9, n, ml_ctable());
+
+    // Symbol compression modes + table descriptions (LL, OF, ML order).
+    out.push_back(static_cast<std::byte>((ll.mode << 6) | (of.mode << 4) |
+                                         (ml.mode << 2)));
+    emit_seq_table(out, ll);
+    emit_seq_table(out, of);
+    emit_seq_table(out, ml);
 
     FseBitWriter w;
     std::uint32_t ll_state = 0, of_state = 0, ml_state = 0;
@@ -319,9 +395,9 @@ void emit_sequences(std::vector<std::byte>& out, const std::vector<Seq>& seqs) {
         Code lc = lit_len_code(s.lit_len);
         Code mc = match_len_code(s.match_len);
         Code oc = offset_code(s.match_dist);
-        ml_state = fse_init_cstate2(ml, mc.code);
-        of_state = fse_init_cstate2(of, oc.code);
-        ll_state = fse_init_cstate2(ll, lc.code);
+        if (ll.mode != 1) ll_state = fse_init_cstate2(ll.ct, lc.code);
+        if (of.mode != 1) of_state = fse_init_cstate2(of.ct, oc.code);
+        if (ml.mode != 1) ml_state = fse_init_cstate2(ml.ct, mc.code);
         if (lc.extra_bits) w.put_bits(static_cast<std::uint32_t>(lc.extra_val), lc.extra_bits);
         if (mc.extra_bits) w.put_bits(static_cast<std::uint32_t>(mc.extra_val), mc.extra_bits);
         if (oc.extra_bits) w.put_bits(static_cast<std::uint32_t>(oc.extra_val), oc.extra_bits);
@@ -331,16 +407,16 @@ void emit_sequences(std::vector<std::byte>& out, const std::vector<Seq>& seqs) {
         Code lc = lit_len_code(s.lit_len);
         Code mc = match_len_code(s.match_len);
         Code oc = offset_code(s.match_dist);
-        fse_encode_symbol(w, of, of_state, oc.code);
-        fse_encode_symbol(w, ml, ml_state, mc.code);
-        fse_encode_symbol(w, ll, ll_state, lc.code);
+        if (of.mode != 1) fse_encode_symbol(w, of.ct, of_state, oc.code);
+        if (ml.mode != 1) fse_encode_symbol(w, ml.ct, ml_state, mc.code);
+        if (ll.mode != 1) fse_encode_symbol(w, ll.ct, ll_state, lc.code);
         if (lc.extra_bits) w.put_bits(static_cast<std::uint32_t>(lc.extra_val), lc.extra_bits);
         if (mc.extra_bits) w.put_bits(static_cast<std::uint32_t>(mc.extra_val), mc.extra_bits);
         if (oc.extra_bits) w.put_bits(static_cast<std::uint32_t>(oc.extra_val), oc.extra_bits);
     }
-    fse_flush_cstate(w, ml, ml_state);
-    fse_flush_cstate(w, of, of_state);
-    fse_flush_cstate(w, ll, ll_state);
+    if (ml.mode != 1) fse_flush_cstate(w, ml.ct, ml_state);
+    if (of.mode != 1) fse_flush_cstate(w, of.ct, of_state);
+    if (ll.mode != 1) fse_flush_cstate(w, ll.ct, ll_state);
     w.put_bit(true);
     w.align_to_byte();
     const auto& bytes = w.data();

@@ -191,4 +191,31 @@ void fse_encode_symbol(FseBitWriter& w, const FseCTable& ct,
 void fse_flush_cstate(FseBitWriter& w, const FseCTable& ct,
                       std::uint32_t value);
 
+// --- Shared FSE table helpers (NCount + normalization + decode table) ---
+
+// Normalize frequencies to a distribution summing to 1<<table_log. Symbols
+// with zero frequency get zero; present symbols get at least 1. No -1
+// entries (useLowProbCount = 0, as zstd uses for Huffman weights).
+void fse_normalize(const unsigned* freqs, int total, int max_symbol,
+                   int table_log, std::vector<int>& norm);
+
+// Write/read an FSE table description (FSE_writeNCount / FSE_readNCount).
+void fse_write_ncount(std::vector<std::byte>& out, const int* norm,
+                      int max_symbol, int table_log);
+auto fse_read_ncount(const std::byte* data, std::size_t size, int& table_log,
+                     std::vector<int>& norm, int& max_symbol,
+                     std::size_t& consumed) -> bool;
+
+// A decoded FSE table: state -> {symbol, nb_bits, next_state}.
+struct FseDecodeTable {
+    int table_log = 0;
+    std::vector<std::uint8_t> symbol;
+    std::vector<std::uint8_t> nb_bits;
+    std::vector<std::uint16_t> next_state;
+};
+
+// Build a decode table from normalized counts (FSE_buildDTable).
+void build_fse_dtable(int table_log, const int* norm, int max_symbol,
+                      FseDecodeTable& dt);
+
 }  // namespace fzip::zstd

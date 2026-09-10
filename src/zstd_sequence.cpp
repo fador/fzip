@@ -11,46 +11,42 @@ namespace fzip::zstd {
 
 namespace {
 
-// Litlen code → (base, extra_bits). 36 codes total.
+// Litlen code → (base, extra_bits). 36 codes total (RFC 8878 §4.2.2).
 constexpr int kLitlenBases[] = {
     0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
-    16,18,20,22,24,26,28,30,
-    32,36,40,44,
-    48,56,64,72,
-    80,96,112,128,
+    16,18,20,22,24,28,32,40,
+    48,64,128,256,512,1024,2048,4096,
+    8192,16384,32768,65536,
 };
 constexpr int kLitlenExtra[] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    1,1,1,1,1,1,1,1,
-    2,2,2,2,
-    3,3,3,3,
-    4,4,4,4,
+    1,1,1,1,2,2,3,3,
+    4,6,7,8,9,10,11,12,
+    13,14,15,16,
 };
 
-// Matchlen code → (base, extra_bits). 53 codes total.
-// Codes 0-31: base=code+3, extra=0
-// Codes 32-35: base=35+(c-32)*2, extra=1
-// Codes 36-39: base=43+(c-36)*4, extra=2
-// Codes 40-43: base=59+(c-40)*8, extra=3
-// Codes 44-47: base=91+(c-44)*16, extra=4
-// Codes 48-52: base=155+(c-48)*32, extra=5
+// Matchlen code → (base, extra_bits). 53 codes total (RFC 8878 §4.2.2).
 constexpr int kMatchlenBases[] = {
     3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,
     19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,
     35,37,39,41,
-    43,47,51,55,
-    59,67,75,83,
-    91,107,123,139,
-    155,187,219,251,283,
+    43,47,
+    51,59,
+    67,83,
+    99,
+    131,
+    259,515,1027,2051,4099,8195,16387,32771,65539,
 };
 constexpr int kMatchlenExtra[] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     1,1,1,1,
-    2,2,2,2,
-    3,3,3,3,
-    4,4,4,4,
-    5,5,5,5,5,
+    2,2,
+    3,3,
+    4,4,
+    5,
+    7,
+    8,9,10,11,12,13,14,15,16,
 };
 
 }  // namespace
@@ -79,9 +75,9 @@ auto offset_code_to_base(int code) -> int {
 
 auto decode_sequences(const std::byte* data, std::size_t size,
                       int num_sequences,
-                      const FseSeqSymbol* litlen_table,
-                      const FseSeqSymbol* offset_table,
-                      const FseSeqSymbol* matchlen_table)
+                      const FseSeqSymbol* litlen_table, int ll_acc,
+                      const FseSeqSymbol* offset_table, int of_acc,
+                      const FseSeqSymbol* matchlen_table, int ml_acc)
     -> std::vector<Sequence> {
     if (num_sequences == 0) return {};
 
@@ -90,9 +86,9 @@ auto decode_sequences(const std::byte* data, std::size_t size,
 
     // Initial states, read (backward) in order: literals length, offset,
     // match length.
-    std::uint32_t ll_state = reader.get_state(6);
-    std::uint32_t of_state = reader.get_state(5);
-    std::uint32_t ml_state = reader.get_state(6);
+    std::uint32_t ll_state = reader.get_state(ll_acc);
+    std::uint32_t of_state = reader.get_state(of_acc);
+    std::uint32_t ml_state = reader.get_state(ml_acc);
 
     std::vector<Sequence> seqs;
     seqs.reserve(static_cast<std::size_t>(num_sequences));

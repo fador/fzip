@@ -73,20 +73,18 @@ auto compress_auto(std::span<const std::byte> data,
             return compress_with(CodecId::Store, data, 0, hint_path);
 
         case FileType::Executable:
-            // Executables: deflate-9 until the custom zstd compressor emits
-            // compressed blocks (it currently only writes raw blocks and
-            // falls back to Store, i.e. no compression at all).
-            return compress_with(CodecId::Deflate, data, 9, hint_path);
+            // Executables: zstd-19 (ratio now on par with deflate, faster
+            // decode).
+            return compress_with(CodecId::Zstd, data, 19, hint_path);
 
         case FileType::Text:
-            // Text/XML/JSON/source: deflate-9 until zstd compressed blocks are
-            // available. Deflate is strictly better than Store here.
-            return compress_with(CodecId::Deflate, data, 9, hint_path);
+            // Text/XML/JSON/source: zstd-19 for maximum ratio.
+            return compress_with(CodecId::Zstd, data, 19, hint_path);
 
         case FileType::Binary:
         default:
-            // General binary: deflate-6 (good universal default).
-            return compress_with(CodecId::Deflate, data, 6, hint_path);
+            // General binary: zstd-19.
+            return compress_with(CodecId::Zstd, data, 19, hint_path);
     }
 }
 

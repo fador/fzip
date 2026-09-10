@@ -23,13 +23,14 @@ struct RepeatOffsets {
 };
 
 // Decode all sequences in a compressed block. The sequences use 3 interleaved
-// FSE streams (literals length, offset code, match length) with the predefined
-// tables. Returns the list of sequences.
+// FSE streams (literals length, offset code, match length). Each stream's
+// table and accuracy log are provided by the caller (predefined, RLE, or a
+// per-block FSE table). Returns the list of sequences.
 auto decode_sequences(const std::byte* data, std::size_t size,
                       int num_sequences,
-                      const FseSeqSymbol* litlen_table,
-                      const FseSeqSymbol* offset_table,
-                      const FseSeqSymbol* matchlen_table)
+                      const FseSeqSymbol* litlen_table, int ll_acc,
+                      const FseSeqSymbol* offset_table, int of_acc,
+                      const FseSeqSymbol* matchlen_table, int ml_acc)
     -> std::vector<Sequence>;
 
 // Execute a sequence: copy `literals_length` literal bytes, then copy
