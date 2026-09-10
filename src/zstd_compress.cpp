@@ -8,8 +8,10 @@
 #include "zstd_internal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <thread>
 
 #include "xxhash.hpp"
 #include "zstd_fse.hpp"
@@ -659,31 +661,75 @@ auto compress(std::span<const std::byte> data, int level,
     }
 
     const auto* p = reinterpret_cast<const std::uint8_t*>(data.data());
-    std::size_t off = 0;
-    while (off < size) {        std::size_t blen = std::min<std::size_t>(kBlockSize, size - off);
-        bool last = (off + blen == size);
 
-        std::vector<std::byte> content;
-        bool compressed =
-            build_compressed_block(p + off, blen, effort, lazy, optimal, content);
-        const std::vector<std::byte>* payload;
-        std::vector<std::byte> raw;
-        if (compressed) {
-            payload = &content;
-        } else {
-            raw.assign(reinterpret_cast<const std::byte*>(p + off),
-                       reinterpret_cast<const std::byte*>(p + off) + blen);
-            payload = &raw;
+    // Split into blocks. Blocks are fully independent — the match finder, the
+    // Huffman/FSE tables, and the parser all operate per block — so they can
+    // be compressed in parallel and concatenated in order afterwards.
+    struct Block {
+        std::size_t off = 0;
+        std::size_t len = 0;
+        bool last = false;
+        std::vector<std::byte> content;  // compressed payload (if any)
+        bool compressed = false;
+    };
+    std::vector<Block> blocks;
+    for (std::size_t off = 0; off < size;) {
+        std::size_t blen = std::min<std::size_t>(kBlockSize, size - off);
+        Block b;
+        b.off = off;
+        b.len = blen;
+        b.last = (off + blen == size);
+        blocks.push_back(std::move(b));
+        off += blen;
+    }
+
+    auto compress_block = [&](Block& b) {
+        b.compressed = build_compressed_block(p + b.off, b.len, effort, lazy,
+                                              optimal, b.content);
+    };
+
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 1;
+    if (blocks.size() < 2 || hw <= 1) {
+        for (Block& b : blocks) {
+            compress_block(b);
         }
+    } else {
+        const unsigned nw =
+            std::min<unsigned>(hw, static_cast<unsigned>(blocks.size()));
+        std::atomic<std::size_t> next{0};
+        std::vector<std::thread> workers;
+        workers.reserve(nw);
+        for (unsigned t = 0; t < nw; ++t) {
+            workers.emplace_back([&]() {
+                for (;;) {
+                    std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= blocks.size()) break;
+                    compress_block(blocks[i]);
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+    }
 
-        std::uint32_t type = compressed ? 2u : 0u;
-        std::uint32_t cs = static_cast<std::uint32_t>(payload->size());
-        std::uint32_t blk_hdr = (last ? 1u : 0u) | (type << 1) | (cs << 3);
+    // Assemble blocks in order.
+    for (const Block& b : blocks) {
+        const std::byte* payload;
+        std::size_t clen;
+        if (b.compressed) {
+            payload = b.content.data();
+            clen = b.content.size();
+        } else {
+            payload = reinterpret_cast<const std::byte*>(p + b.off);
+            clen = b.len;
+        }
+        std::uint32_t type = b.compressed ? 2u : 0u;
+        std::uint32_t cs = static_cast<std::uint32_t>(clen);
+        std::uint32_t blk_hdr = (b.last ? 1u : 0u) | (type << 1) | (cs << 3);
         output.push_back(static_cast<std::byte>(blk_hdr & 0xFF));
         output.push_back(static_cast<std::byte>((blk_hdr >> 8) & 0xFF));
         output.push_back(static_cast<std::byte>((blk_hdr >> 16) & 0xFF));
-        output.insert(output.end(), payload->begin(), payload->end());
-        off += blen;
+        output.insert(output.end(), payload, payload + clen);
     }
 
     std::uint64_t checksum = xxhash64(data);
