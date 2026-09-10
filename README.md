@@ -15,15 +15,15 @@ A state-of-the-art ZIP compressor in C++20, built to benchmark against
   - **Decompressor**: FSE decoder (reverse bitstream, predefined tables),
     Huffman decoder (single + 4-stream), sequence decoder (3 interleaved FSE
     streams, repeat offsets), full frame/block parsing.
-  - **Compressor**: emits spec-correct **compressed blocks** — a raw
-    literals section plus FSE-coded sequences using the predefined
-    distributions. Frame/block headers and the content checksum are
-    produced per RFC 8878. Verified against 7za 25.01 and fzip's own
-    extractor.
-  - Not yet ratio-competitive with deflate: literals are stored raw (no
-    Huffman coding) and sequence symbols use the predefined FSE tables
-    rather than per-block optimized tables. `auto` therefore still prefers
-    deflate.
+  - **Compressor**: emits spec-correct **compressed blocks** — literals are
+    Huffman-coded (4-stream) when beneficial, otherwise RLE/raw, and
+    sequences are FSE-coded using the predefined distributions. Frame/block
+    headers and the content checksum follow RFC 8878. Verified against
+    7za 25.01 and fzip's own extractor.
+  - Not yet ratio-competitive with deflate: the Huffman weight table is
+    direct-encoded, so literal symbols > 128 fall back to raw (binary data),
+    and sequence symbols use the predefined FSE tables rather than
+    per-block optimized tables. `auto` therefore still prefers deflate.
 - **Per-file codec selection** based on magic-byte type detection:
   incompressible → Store, executables → deflate-9, text → deflate-9,
   general binary → deflate-6.
@@ -125,9 +125,10 @@ output (the unused bit patterns never appeared), but other tools could not.
 The package-merge builder guarantees a complete, optimal length-limited code.
 
 The custom zstd path is now spec-correct end to end: `fzip zstd` output is
-decoded successfully by 7za 25.01 as well as by `fzip extract`. Remaining
-ratio work for zstd: Huffman-coded literals (instead of raw), per-block FSE
-tables (instead of predefined), and lazy/optimal parsing.
+decoded successfully by 7za 25.01 as well as by `fzip extract`, including
+Huffman-coded literals. Remaining ratio work for zstd: FSE-compressed weight
+tables (to Huffman-code literals with symbols > 128), per-block FSE tables
+(instead of predefined), and lazy/optimal parsing.
 
 ## State-of-the-art analysis
 
