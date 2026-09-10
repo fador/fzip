@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace fzip {
@@ -731,29 +733,70 @@ auto deflate_compress(std::span<const std::byte> data, int level)
     const auto* p = reinterpret_cast<const std::uint8_t*>(data.data());
     std::size_t size = data.size();
 
-    // Process in blocks to bound memory and allow per-block tree fitting.
-    std::size_t off = 0;
-    bool first = true;
-    while (off < size) {
-        std::size_t end = std::min(off + kBlockSize, size);
-        std::size_t blen = end - off;
+    // Each block's LZ77 tokenization is independent (hash chains and Huffman
+    // frequency tables are per block). Tokenize a bounded wave of blocks in
+    // parallel, then emit them in order, bounding peak token memory.
+    struct BlockJob {
+        std::size_t off = 0;
+        std::size_t len = 0;
+        bool final = false;
+        std::vector<Token> tokens;
         std::array<std::uint32_t, 288> lit_freq{};
         std::array<std::uint32_t, 32> dist_freq{};
-        auto tokens = lz77_encode(p + off, blen, level, lit_freq, dist_freq);
-        bool final = (end == size);
+    };
 
-        // Decide block type: try dynamic; if the input is tiny or highly
-        // incompressible, fall back to fixed or stored. We compare sizes
-        // only for the whole stream at the end; here we pick dynamic for
-        // level >= 4 and fixed for lower levels, unless the token stream
-        // is trivially small.
-        if (level >= 4) {
-            emit_dynamic_block(w, final, tokens, lit_freq, dist_freq);
-        } else {
-            emit_fixed_block(w, final, tokens);
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 1;
+    const std::size_t wave_size = std::min<std::size_t>(hw, 8);
+
+    std::size_t off = 0;
+    while (off < size) {
+        std::vector<BlockJob> wave;
+        for (std::size_t i = 0; i < wave_size && off < size; ++i) {
+            std::size_t end = std::min(off + kBlockSize, size);
+            BlockJob job;
+            job.off = off;
+            job.len = end - off;
+            job.final = (end == size);
+            wave.push_back(std::move(job));
+            off = end;
         }
-        off = end;
-        first = false;
+
+        auto tokenize = [&](BlockJob& job) {
+            job.tokens = lz77_encode(p + job.off, job.len, level, job.lit_freq,
+                                     job.dist_freq);
+        };
+        if (wave.size() < 2 || hw <= 1) {
+            for (BlockJob& job : wave) {
+                tokenize(job);
+            }
+        } else {
+            const unsigned nw =
+                std::min<unsigned>(hw, static_cast<unsigned>(wave.size()));
+            std::atomic<std::size_t> next{0};
+            std::vector<std::thread> workers;
+            workers.reserve(nw);
+            for (unsigned t = 0; t < nw; ++t) {
+                workers.emplace_back([&]() {
+                    for (;;) {
+                        std::size_t i =
+                            next.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= wave.size()) break;
+                        tokenize(wave[i]);
+                    }
+                });
+            }
+            for (auto& worker : workers) worker.join();
+        }
+
+        for (const BlockJob& job : wave) {
+            if (level >= 4) {
+                emit_dynamic_block(w, job.final, job.tokens, job.lit_freq,
+                                   job.dist_freq);
+            } else {
+                emit_fixed_block(w, job.final, job.tokens);
+            }
+        }
     }
 
     w.align_to_byte();
