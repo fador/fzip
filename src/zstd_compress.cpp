@@ -8,12 +8,14 @@
 #include "zstd_internal.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "xxhash.hpp"
 #include "zstd_fse.hpp"
 #include "zstd_huffman.hpp"
 #include "zstd_predefined.hpp"
+#include "zstd_sequence.hpp"
 
 namespace fzip::zstd {
 
@@ -157,12 +159,153 @@ auto build_sequences(const std::uint8_t* data, std::size_t size, int effort,
     return seqs;
 }
 
-// --- Code tables (RFC 8878 §4.2.2) ---
 struct Code {
     int code = 0;
     int extra_bits = 0;
     int extra_val = 0;
 };
+
+// Shannon cost in bits for a symbol with the given frequency.
+struct Code;
+auto lit_len_code(int len) -> Code;
+auto match_len_code(int len) -> Code;
+auto offset_code(int dist) -> Code;
+
+inline auto sym_cost(int freq, int total) -> float {
+    if (freq <= 0 || total <= 0) return 12.0f;
+    return -std::log2(static_cast<float>(freq) / static_cast<float>(total));
+}
+
+// Optimal (shortest-path) LZ77 parse. Costs are estimated from a first-pass
+// lazy parse (literals via Shannon entropy, sequence codes via FSE
+// probability plus extra bits), then a backward DP picks the cheapest token
+// sequence. Runs per 128 KiB block.
+auto build_sequences_optimal(const std::uint8_t* data, std::size_t size,
+                             int effort, std::vector<std::uint8_t>& literals)
+    -> std::vector<Seq> {
+    const int N = static_cast<int>(size);
+    if (N <= 0) {
+        literals.clear();
+        return {};
+    }
+
+    // Pass 1: lazy parse to estimate symbol costs.
+    std::vector<std::uint8_t> lits_a;
+    std::vector<Seq> seqs_a = build_sequences(data, size, effort, true, lits_a);
+    int lit_freq[256] = {0};
+    for (std::uint8_t b : lits_a) lit_freq[b]++;
+    int ll_freq[36] = {0};
+    int of_freq[32] = {0};
+    int ml_freq[53] = {0};
+    for (const Seq& s : seqs_a) {
+        ll_freq[lit_len_code(s.lit_len).code]++;
+        of_freq[offset_code(s.match_dist).code]++;
+        ml_freq[match_len_code(s.match_len).code]++;
+    }
+    const int n_lit = static_cast<int>(lits_a.size());
+    const int n_seq = static_cast<int>(seqs_a.size());
+
+    float lit_cost[256];
+    for (int s = 0; s < 256; ++s) {
+        float c = sym_cost(lit_freq[s], n_lit);
+        if (c > 12.0f) c = 12.0f;
+        if (c < 1.0f) c = 1.0f;
+        lit_cost[s] = c;
+    }
+    float mlc_cost[53];
+    for (int c = 0; c < 53; ++c) {
+        mlc_cost[c] = sym_cost(ml_freq[c], n_seq) +
+                      static_cast<float>(matchlen_code_to_extra(c));
+    }
+    float ofc_cost[32];
+    for (int c = 0; c < 32; ++c) {
+        ofc_cost[c] = sym_cost(of_freq[c], n_seq) + static_cast<float>(c);
+    }
+    // Max match length representable by each match-length code.
+    int ml_range_max[53];
+    for (int c = 0; c < 53; ++c) {
+        ml_range_max[c] = matchlen_code_to_base(c) +
+                          (1 << matchlen_code_to_extra(c)) - 1;
+    }
+
+    // Forward pass: longest match at every position. The DP refines the parse,
+    // so a shallower chain walk is enough and much faster.
+    const int fwd_effort = effort;
+    std::vector<int> best_len(static_cast<std::size_t>(N), 0);
+    std::vector<int> best_dist(static_cast<std::size_t>(N), 0);
+    {
+        std::vector<int> head(kHashSize, -1);
+        std::vector<int> prev(kWindow, -1);
+        for (int p = 0; p < N; ++p) {
+            Match m = find_match(data, size, static_cast<std::size_t>(p), head,
+                                 prev, fwd_effort);
+            best_len[static_cast<std::size_t>(p)] = m.length;
+            best_dist[static_cast<std::size_t>(p)] = m.distance;
+            insert_hash(data, size, static_cast<std::size_t>(p), head, prev);
+        }
+    }
+
+    // Backward DP.
+    const int c_min = match_len_code(kMinMatch).code;
+    std::vector<float> cost(static_cast<std::size_t>(N) + 1, 0.0f);
+    std::vector<int> choice_len(static_cast<std::size_t>(N), 1);
+    std::vector<int> choice_dist(static_cast<std::size_t>(N), 0);
+    for (int i = N - 1; i >= 0; --i) {
+        float best = lit_cost[data[i]] + cost[static_cast<std::size_t>(i) + 1];
+        int bl = 1;
+        int bd = 0;
+        const int ml = best_len[static_cast<std::size_t>(i)];
+        if (ml >= kMinMatch) {
+            const int d = best_dist[static_cast<std::size_t>(i)];
+            const float dc = ofc_cost[offset_code(d).code];
+            const int c_max = match_len_code(ml).code;
+            for (int c = c_min; c <= c_max; ++c) {
+                int L = ml_range_max[c];
+                if (L > ml) L = ml;
+                if (L < kMinMatch) continue;
+                float mc = mlc_cost[c] + dc +
+                           cost[static_cast<std::size_t>(i + L)];
+                if (mc < best) {
+                    best = mc;
+                    bl = L;
+                    bd = d;
+                }
+            }
+        }
+        cost[static_cast<std::size_t>(i)] = best;
+        choice_len[static_cast<std::size_t>(i)] = bl;
+        choice_dist[static_cast<std::size_t>(i)] = bd;
+    }
+
+    // Reconstruct the token stream.
+    std::vector<Seq> seqs;
+    literals.clear();
+    int pos = 0;
+    int lit_start = 0;
+    while (pos < N) {
+        const int L = choice_len[static_cast<std::size_t>(pos)];
+        if (L <= 1) {
+            ++pos;
+            continue;
+        }
+        for (int i = lit_start; i < pos; ++i) {
+            literals.push_back(data[i]);
+        }
+        Seq s;
+        s.lit_len = pos - lit_start;
+        s.match_len = L;
+        s.match_dist = choice_dist[static_cast<std::size_t>(pos)];
+        seqs.push_back(s);
+        pos += L;
+        lit_start = pos;
+    }
+    for (int i = lit_start; i < N; ++i) {
+        literals.push_back(data[i]);
+    }
+    return seqs;
+}
+
+// --- Code tables (RFC 8878 §4.2.2) ---
 
 Code lit_len_code(int len) {
     static const int kBase[36] = {
@@ -456,10 +599,12 @@ void emit_sequences(std::vector<std::byte>& out, const std::vector<Seq>& seqs) {
 // Build the content of a compressed block. Returns false if the block cannot
 // be represented as a compressed block (should fall back to a raw block).
 auto build_compressed_block(const std::uint8_t* data, std::size_t size,
-                            int effort, bool lazy,
+                            int effort, bool lazy, bool optimal,
                             std::vector<std::byte>& out) -> bool {
     std::vector<std::uint8_t> literals;
-    std::vector<Seq> seqs = build_sequences(data, size, effort, lazy, literals);
+    std::vector<Seq> seqs =
+        optimal ? build_sequences_optimal(data, size, effort, literals)
+                : build_sequences(data, size, effort, lazy, literals);
     if (seqs.empty()) return false;  // nothing to gain from a compressed block
     out.clear();
     emit_literals(out, literals);
@@ -479,6 +624,8 @@ auto compress(std::span<const std::byte> data, int level,
     // Lazy matching roughly doubles match-finder work, so only enable it for
     // levels where ratio matters more than throughput.
     bool lazy = (level >= 6);
+    // Optimal (shortest-path) parsing for the highest levels.
+    bool optimal = (level >= 19);
 
     std::size_t size = data.size();
 
@@ -517,7 +664,8 @@ auto compress(std::span<const std::byte> data, int level,
         bool last = (off + blen == size);
 
         std::vector<std::byte> content;
-        bool compressed = build_compressed_block(p + off, blen, effort, lazy, content);
+        bool compressed =
+            build_compressed_block(p + off, blen, effort, lazy, optimal, content);
         const std::vector<std::byte>* payload;
         std::vector<std::byte> raw;
         if (compressed) {
