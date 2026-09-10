@@ -91,39 +91,69 @@ struct Seq {
 };
 
 auto build_sequences(const std::uint8_t* data, std::size_t size, int effort,
-                     std::vector<std::uint8_t>& literals) -> std::vector<Seq> {
+                     bool lazy, std::vector<std::uint8_t>& literals)
+    -> std::vector<Seq> {
     std::vector<Seq> seqs;
     literals.clear();
 
     std::vector<int> head(kHashSize, -1);
     std::vector<int> prev(kWindow, -1);
 
+    auto flush_literals = [&](std::size_t from, std::size_t to) {
+        for (std::size_t i = from; i < to; ++i) {
+            literals.push_back(data[i]);
+        }
+    };
+
     std::size_t pos = 0;
     std::size_t lit_start = 0;
     while (pos < size) {
         Match m = find_match(data, size, pos, head, prev, effort);
-        if (m.length >= kMinMatch) {
-            for (std::size_t i = lit_start; i < pos; ++i) {
-                literals.push_back(data[i]);
-            }
-            Seq s;
-            s.lit_len = static_cast<int>(pos - lit_start);
-            s.match_len = m.length;
-            s.match_dist = m.distance;
-            seqs.push_back(s);
-            for (int i = 0; i < m.length; ++i) {
-                insert_hash(data, size, pos + i, head, prev);
-            }
-            pos += static_cast<std::size_t>(m.length);
-            lit_start = pos;
-        } else {
+        if (m.length < kMinMatch) {
             insert_hash(data, size, pos, head, prev);
             ++pos;
+            continue;
         }
+
+        // Lazy matching: insert pos, then look one byte ahead. If the next
+        // position yields a longer match, emit a literal here and take it.
+        if (lazy) {
+            insert_hash(data, size, pos, head, prev);
+            Match m2 = find_match(data, size, pos + 1, head, prev, effort);
+            if (m2.length > m.length) {
+                ++pos;
+                m = m2;
+                flush_literals(lit_start, pos);
+                Seq s;
+                s.lit_len = static_cast<int>(pos - lit_start);
+                s.match_len = m.length;
+                s.match_dist = m.distance;
+                seqs.push_back(s);
+                for (int i = 0; i < m.length; ++i) {
+                    insert_hash(data, size, pos + i, head, prev);
+                }
+                pos += static_cast<std::size_t>(m.length);
+                lit_start = pos;
+                continue;
+            }
+        } else {
+            insert_hash(data, size, pos, head, prev);
+        }
+
+        // Take the match at pos (pos already inserted).
+        flush_literals(lit_start, pos);
+        Seq s;
+        s.lit_len = static_cast<int>(pos - lit_start);
+        s.match_len = m.length;
+        s.match_dist = m.distance;
+        seqs.push_back(s);
+        for (int i = 1; i < m.length; ++i) {
+            insert_hash(data, size, pos + i, head, prev);
+        }
+        pos += static_cast<std::size_t>(m.length);
+        lit_start = pos;
     }
-    for (std::size_t i = lit_start; i < size; ++i) {
-        literals.push_back(data[i]);
-    }
+    flush_literals(lit_start, size);
     return seqs;
 }
 
@@ -426,9 +456,10 @@ void emit_sequences(std::vector<std::byte>& out, const std::vector<Seq>& seqs) {
 // Build the content of a compressed block. Returns false if the block cannot
 // be represented as a compressed block (should fall back to a raw block).
 auto build_compressed_block(const std::uint8_t* data, std::size_t size,
-                            int effort, std::vector<std::byte>& out) -> bool {
+                            int effort, bool lazy,
+                            std::vector<std::byte>& out) -> bool {
     std::vector<std::uint8_t> literals;
-    std::vector<Seq> seqs = build_sequences(data, size, effort, literals);
+    std::vector<Seq> seqs = build_sequences(data, size, effort, lazy, literals);
     if (seqs.empty()) return false;  // nothing to gain from a compressed block
     out.clear();
     emit_literals(out, literals);
@@ -444,7 +475,10 @@ auto compress(std::span<const std::byte> data, int level,
     if (level < 1) level = 1;
     if (level > 22) level = 22;
     // Map zstd level to a match-finder effort.
-    int effort = 1 << std::min(level, 12);
+    int effort = 1 << std::min(level, 9);  // cap chain walks at 512 steps
+    // Lazy matching roughly doubles match-finder work, so only enable it for
+    // levels where ratio matters more than throughput.
+    bool lazy = (level >= 6);
 
     std::size_t size = data.size();
 
@@ -483,7 +517,7 @@ auto compress(std::span<const std::byte> data, int level,
         bool last = (off + blen == size);
 
         std::vector<std::byte> content;
-        bool compressed = build_compressed_block(p + off, blen, effort, content);
+        bool compressed = build_compressed_block(p + off, blen, effort, lazy, content);
         const std::vector<std::byte>* payload;
         std::vector<std::byte> raw;
         if (compressed) {
