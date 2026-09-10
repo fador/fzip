@@ -19,11 +19,12 @@ A state-of-the-art ZIP compressor in C++20, built to benchmark against
     Huffman-coded (4-stream, with FSE- or direct-encoded weight tables) when
     beneficial, otherwise RLE/raw, and sequences are FSE-coded with
     **per-block tables** (RLE for single-symbol streams, predefined for tiny
-    blocks). Frame/block headers and the content checksum follow RFC 8878.
+    blocks). The LZ77 parser uses one-byte-lookahead lazy matching at higher
+    levels. Frame/block headers and the content checksum follow RFC 8878.
     Verified against 7za 25.01 and fzip's own extractor.
   - Ratio now matches deflate while decoding much faster. Remaining ratio
-    work: lazy/optimal LZ77 parsing. `auto` picks zstd-19 for text,
-    executables, and general binary.
+    work: optimal (shortest-path) LZ77 parsing. `auto` picks zstd-19 for
+    text, executables, and general binary.
 - **Per-file codec selection** based on magic-byte type detection:
   incompressible → Store, executables → deflate-9, text → deflate-9,
   general binary → deflate-6.
@@ -81,9 +82,9 @@ Config                  Size   Ratio  Compress   Decompress
 fzip store          1008.8 KB   0.964 54.0 MB/s   52.0 MB/s
 fzip deflate-6       661.5 KB   1.469 19.0 MB/s   27.8 MB/s
 fzip deflate-9       661.4 KB   1.470 17.3 MB/s   28.1 MB/s
-fzip zstd-1          684.6 KB   1.420 32.4 MB/s   35.6 MB/s
-fzip zstd-19         661.4 KB   1.470 15.4 MB/s   37.8 MB/s
-fzip auto            661.4 KB   1.470 15.1 MB/s   40.5 MB/s
+fzip zstd-1          684.6 KB   1.420 33.6 MB/s   36.8 MB/s
+fzip zstd-19         661.3 KB   1.470 10.1 MB/s   36.9 MB/s
+fzip auto            661.3 KB   1.470  9.4 MB/s   38.9 MB/s
 7za deflate-5        643.0 KB   1.512 10.6 MB/s   31.8 MB/s
 7za deflate-9        640.1 KB   1.518  2.8 MB/s   30.0 MB/s
 7za LZMA-9           632.9 KB   1.536 11.0 MB/s   22.0 MB/s
@@ -124,9 +125,9 @@ The package-merge builder guarantees a complete, optimal length-limited code.
 
 The custom zstd path is now spec-correct end to end: `fzip zstd` output is
 decoded successfully by 7za 25.01 as well as by `fzip extract`, including
-Huffman-coded literals (with FSE- or direct-encoded weight tables) and
-per-block sequence FSE tables. Remaining ratio work for zstd: lazy/optimal
-LZ77 parsing.
+Huffman-coded literals (with FSE- or direct-encoded weight tables), per-block
+sequence FSE tables, and lazy LZ77 matching. Remaining ratio work for zstd:
+optimal (shortest-path) LZ77 parsing.
 
 ## State-of-the-art analysis
 
