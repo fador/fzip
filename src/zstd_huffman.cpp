@@ -130,7 +130,13 @@ void finalize_codes(HufTable& t) {
     }
 }
 
-// Serialize the tree description in direct (nibble) mode.
+// Forward declarations for the FSE weight codec (defined below).
+auto fse_compress_weights(const std::vector<std::uint8_t>& weights,
+                          std::vector<std::byte>& out) -> bool;
+auto fse_decompress_weights(const std::byte* data, std::size_t size,
+                            std::vector<std::uint8_t>& out) -> bool;
+
+// Serialize the tree description (direct or FSE-compressed weights).
 auto write_weights(const HufTable& t, std::vector<std::byte>& out) -> bool {
     const int table_log = t.table_log;
     std::vector<int> weights(t.lengths.size(), 0);
@@ -142,10 +148,26 @@ auto write_weights(const HufTable& t, std::vector<std::byte>& out) -> bool {
         }
     }
     if (max_sym < 1) return false;    // need at least 2 symbols
-    if (max_sym > 128) return false;  // direct mode can't represent >128
-    const int num_weights = max_sym;  // symbols 0..max_sym-1 encoded
-    weights[static_cast<std::size_t>(max_sym)] = 0;  // unused low nibble
+    const int num_weights = max_sym;  // the last (implied) weight is not coded
 
+    // Try FSE-compressed weights first (works for symbols > 128).
+    std::vector<std::uint8_t> wseq(static_cast<std::size_t>(num_weights));
+    for (int i = 0; i < num_weights; ++i) {
+        wseq[static_cast<std::size_t>(i)] =
+            static_cast<std::uint8_t>(weights[static_cast<std::size_t>(i)]);
+    }
+    std::vector<std::byte> fse_body;
+    if (fse_compress_weights(wseq, fse_body) && fse_body.size() > 1 &&
+        fse_body.size() < static_cast<std::size_t>(num_weights / 2) &&
+        fse_body.size() < 128) {
+        out.push_back(static_cast<std::byte>(fse_body.size()));
+        out.insert(out.end(), fse_body.begin(), fse_body.end());
+        return true;
+    }
+
+    // Direct (nibble) mode: only representable up to symbol 128.
+    if (max_sym > 128) return false;
+    weights[static_cast<std::size_t>(max_sym)] = 0;  // unused low nibble
     out.push_back(static_cast<std::byte>(127 + num_weights));
     for (int n = 0; n < num_weights; n += 2) {
         int hi = weights[static_cast<std::size_t>(n)] & 0xF;
@@ -203,6 +225,377 @@ void stream_sizes(int total, int sizes[4]) {
     sizes[0] = sizes[1] = sizes[2] = each;
     sizes[3] = total - 3 * each;
     if (sizes[3] < 0) sizes[3] = 0;
+}
+
+// ---------------------------------------------------------------------------
+// FSE-compressed Huffman weights (RFC 8878 §4.2.1.1.2).
+//
+// The weight sequence is FSE-coded with 2 interleaved states sharing an
+// inline-described distribution. Ported from the zstd reference (FSE NCount
+// read/write, FSE_buildDTable, FSE_compress/decompress_usingCTable).
+// ---------------------------------------------------------------------------
+
+// Forward, LSB-first bit reader with lookahead (for the NCount description).
+struct FwdBits {
+    const std::uint8_t* d;
+    std::size_t n;
+    std::size_t pos = 0;
+    auto peek(int bits) const -> std::uint32_t {
+        std::uint32_t v = 0;
+        for (int i = 0; i < bits; ++i) {
+            std::size_t p = pos + static_cast<std::size_t>(i);
+            std::uint32_t b = (p < n * 8) ? ((d[p >> 3] >> (p & 7)) & 1u) : 0u;
+            v |= b << i;
+        }
+        return v;
+    }
+    void skip(int bits) { pos += static_cast<std::size_t>(bits); }
+};
+
+// Read an FSE table description (FSE_readNCount). Returns false on error.
+auto fse_read_ncount(const std::byte* data, std::size_t size, int& table_log,
+                     std::vector<int>& norm, int& max_symbol,
+                     std::size_t& consumed) -> bool {
+    if (size < 1) return false;
+    FwdBits r{reinterpret_cast<const std::uint8_t*>(data), size};
+    int nb = static_cast<int>(r.peek(4)) + 5;
+    r.skip(4);
+    if (nb > 12) return false;
+    table_log = nb;
+    int remaining = (1 << nb) + 1;
+    int threshold = 1 << nb;
+    int nb_bits = nb + 1;
+    std::vector<int> counts(256, 0);
+    int charnum = 0;
+    int previous0 = 0;
+    while (true) {
+        if (previous0) {
+            int repeats = 0;
+            while (r.peek(2) == 3) {
+                repeats += 3;
+                r.skip(2);
+            }
+            int final_code = static_cast<int>(r.peek(2));
+            r.skip(2);
+            charnum += repeats + final_code;
+            if (charnum >= 256) break;
+            previous0 = 0;
+        }
+        int max = (2 * threshold - 1) - remaining;
+        int count;
+        if (static_cast<int>(r.peek(nb_bits - 1)) < max) {
+            count = static_cast<int>(r.peek(nb_bits - 1));
+            r.skip(nb_bits - 1);
+        } else {
+            int v = static_cast<int>(r.peek(nb_bits)) & (2 * threshold - 1);
+            count = v;
+            if (count >= threshold) count -= max;
+            r.skip(nb_bits);
+        }
+        count--;
+        remaining -= (count < 0 ? -count : count);
+        counts[static_cast<std::size_t>(charnum++)] = count;
+        previous0 = (count == 0);
+        if (remaining < threshold) {
+            if (remaining <= 1) break;
+            nb_bits = highbit_u32(static_cast<std::uint32_t>(remaining)) + 1;
+            threshold = 1 << (nb_bits - 1);
+        }
+        if (charnum >= 256) break;
+    }
+    if (remaining != 1) return false;
+    max_symbol = charnum - 1;
+    if (max_symbol < 0) return false;
+    norm.assign(counts.begin(), counts.begin() + max_symbol + 1);
+    consumed = (r.pos + 7) / 8;
+    return true;
+}
+
+// Write an FSE table description (FSE_writeNCount), LSB-first forward.
+void fse_write_ncount(std::vector<std::byte>& out, const std::vector<int>& norm,
+                      int max_symbol, int table_log) {
+    const int table_size = 1 << table_log;
+    std::uint32_t bit_stream = 0;
+    int bit_count = 0;
+    auto flush = [&]() {
+        while (bit_count >= 8) {
+            out.push_back(static_cast<std::byte>(bit_stream & 0xFF));
+            bit_stream >>= 8;
+            bit_count -= 8;
+        }
+    };
+    auto put = [&](std::uint32_t v, int bits) {
+        bit_stream |= (v & ((1u << bits) - 1u)) << bit_count;
+        bit_count += bits;
+        flush();
+    };
+
+    put(static_cast<std::uint32_t>(table_log - 5), 4);
+    int remaining = table_size + 1;
+    int threshold = table_size;
+    int nb_bits = table_log + 1;
+    unsigned symbol = 0;
+    const unsigned alphabet = static_cast<unsigned>(max_symbol) + 1;
+    int previous_is0 = 0;
+    while (symbol < alphabet && remaining > 1) {
+        if (previous_is0) {
+            unsigned start = symbol;
+            while (symbol < alphabet && norm[symbol] == 0) ++symbol;
+            if (symbol == alphabet) break;
+            while (symbol >= start + 24) {
+                start += 24;
+                put(0xFFFF, 16);
+            }
+            while (symbol >= start + 3) {
+                start += 3;
+                put(3, 2);
+            }
+            put(symbol - start, 2);
+            previous_is0 = 0;
+        }
+        int count = norm[symbol++];
+        int max = (2 * threshold - 1) - remaining;
+        remaining -= (count < 0 ? -count : count);
+        count++;
+        if (count >= threshold) count += max;
+        int width = nb_bits - (count < max ? 1 : 0);
+        put(static_cast<std::uint32_t>(count), width);
+        previous_is0 = (count == 1);
+        while (remaining < threshold) {
+            nb_bits--;
+            threshold >>= 1;
+        }
+    }
+    // Flush remaining bits.
+    while (bit_count > 0) {
+        out.push_back(static_cast<std::byte>(bit_stream & 0xFF));
+        bit_stream >>= 8;
+        bit_count -= 8;
+    }
+}
+
+// Normalize counts to sum = 1<<table_log (no -1 entries, matching zstd's
+// weight compression which uses useLowProbCount=0).
+void fse_normalize(const std::vector<unsigned>& count, int total, int max_symbol,
+                   int table_log, std::vector<int>& norm) {
+    const int table_size = 1 << table_log;
+    norm.assign(static_cast<std::size_t>(max_symbol) + 1, 0);
+    if (total <= 0) return;
+    // Proportional with at least 1 for present symbols, then fix the sum.
+    int sum = 0;
+    for (int s = 0; s <= max_symbol; ++s) {
+        if (count[static_cast<std::size_t>(s)] > 0) {
+            int v = static_cast<int>(
+                (static_cast<long long>(count[static_cast<std::size_t>(s)]) *
+                 table_size) / total);
+            if (v < 1) v = 1;
+            norm[static_cast<std::size_t>(s)] = v;
+            sum += v;
+        }
+    }
+    // Adjust to exactly table_size.
+    while (sum > table_size) {
+        int best = -1;
+        for (int s = 0; s <= max_symbol; ++s) {
+            if (norm[static_cast<std::size_t>(s)] > 1 &&
+                (best < 0 || norm[static_cast<std::size_t>(s)] >
+                                 norm[static_cast<std::size_t>(best)])) {
+                best = s;
+            }
+        }
+        if (best < 0) break;
+        norm[static_cast<std::size_t>(best)]--;
+        sum--;
+    }
+    while (sum < table_size) {
+        int best = 0;
+        for (int s = 1; s <= max_symbol; ++s) {
+            if (norm[static_cast<std::size_t>(s)] >
+                norm[static_cast<std::size_t>(best)]) {
+                best = s;
+            }
+        }
+        norm[static_cast<std::size_t>(best)]++;
+        sum++;
+    }
+}
+
+// FSE decoding table for the weight stream.
+struct WeightDTable {
+    int table_log = 0;
+    std::vector<std::uint8_t> symbol;
+    std::vector<std::uint8_t> nb_bits;
+    std::vector<std::uint16_t> next_state;
+};
+
+void build_weight_dtable(int table_log, const std::vector<int>& norm,
+                         int max_symbol, WeightDTable& dt) {
+    const int table_size = 1 << table_log;
+    const int mask = table_size - 1;
+    const int step = (table_size >> 1) + (table_size >> 3) + 3;
+    std::vector<int> symbol_next(static_cast<std::size_t>(max_symbol) + 1, 0);
+    std::vector<std::uint8_t> spread(static_cast<std::size_t>(table_size), 0);
+    int high_threshold = table_size - 1;
+    for (int s = 0; s <= max_symbol; ++s) {
+        int n = norm[static_cast<std::size_t>(s)];
+        if (n == -1) {
+            spread[static_cast<std::size_t>(high_threshold--)] =
+                static_cast<std::uint8_t>(s);
+            symbol_next[static_cast<std::size_t>(s)] = 1;
+        } else {
+            symbol_next[static_cast<std::size_t>(s)] = n;
+        }
+    }
+    if (high_threshold == table_size - 1) {
+        std::vector<std::uint8_t> flat(static_cast<std::size_t>(table_size), 0);
+        int pos = 0;
+        for (int s = 0; s <= max_symbol; ++s) {
+            for (int i = 0; i < norm[static_cast<std::size_t>(s)]; ++i) {
+                flat[static_cast<std::size_t>(pos++)] =
+                    static_cast<std::uint8_t>(s);
+            }
+        }
+        int position = 0;
+        for (int i = 0; i < table_size; ++i) {
+            spread[static_cast<std::size_t>(position) & mask] =
+                flat[static_cast<std::size_t>(i)];
+            position = (position + step) & mask;
+        }
+    } else {
+        int position = 0;
+        for (int s = 0; s <= max_symbol; ++s) {
+            for (int i = 0; i < norm[static_cast<std::size_t>(s)]; ++i) {
+                spread[static_cast<std::size_t>(position)] =
+                    static_cast<std::uint8_t>(s);
+                position = (position + step) & mask;
+                while (position > high_threshold) {
+                    position = (position + step) & mask;
+                }
+            }
+        }
+    }
+    dt.table_log = table_log;
+    dt.symbol.assign(static_cast<std::size_t>(table_size), 0);
+    dt.nb_bits.assign(static_cast<std::size_t>(table_size), 0);
+    dt.next_state.assign(static_cast<std::size_t>(table_size), 0);
+    for (int u = 0; u < table_size; ++u) {
+        int s = spread[static_cast<std::size_t>(u)];
+        int ns = symbol_next[static_cast<std::size_t>(s)]++;
+        int nb = table_log - highbit_u32(static_cast<std::uint32_t>(ns));
+        dt.symbol[static_cast<std::size_t>(u)] = static_cast<std::uint8_t>(s);
+        dt.nb_bits[static_cast<std::size_t>(u)] = static_cast<std::uint8_t>(nb);
+        dt.next_state[static_cast<std::size_t>(u)] =
+            static_cast<std::uint16_t>((ns << nb) - table_size);
+    }
+}
+
+// FSE 2-state encode (FSE_compress_usingCTable_generic, 64-bit build).
+void fse_encode_2state(FseBitWriter& w, const FseCTable& ct,
+                       const std::uint8_t* src, int n) {
+    int ip = n;
+    std::uint32_t st1 = 0, st2 = 0;
+    if (n & 1) {
+        st1 = fse_init_cstate2(ct, src[--ip]);
+        st2 = fse_init_cstate2(ct, src[--ip]);
+        fse_encode_symbol(w, ct, st1, src[--ip]);
+    } else {
+        st2 = fse_init_cstate2(ct, src[--ip]);
+        st1 = fse_init_cstate2(ct, src[--ip]);
+    }
+    int rem = n - 2;
+    if (rem & 2) {
+        fse_encode_symbol(w, ct, st2, src[--ip]);
+        fse_encode_symbol(w, ct, st1, src[--ip]);
+    }
+    while (ip > 0) {
+        fse_encode_symbol(w, ct, st2, src[--ip]);
+        fse_encode_symbol(w, ct, st1, src[--ip]);
+        fse_encode_symbol(w, ct, st2, src[--ip]);
+        fse_encode_symbol(w, ct, st1, src[--ip]);
+    }
+    fse_flush_cstate(w, ct, st2);
+    fse_flush_cstate(w, ct, st1);
+    w.put_bit(true);
+    w.align_to_byte();
+}
+
+// FSE 2-state decode with zstd overflow semantics.
+void fse_decode_2state(const WeightDTable& dt, const std::byte* data,
+                       std::size_t size, std::vector<std::uint8_t>& out,
+                       int max_out) {
+    FseBitReader r(data, size);
+    std::uint32_t s1 = r.read_bits_padded(dt.table_log);
+    std::uint32_t s2 = r.read_bits_padded(dt.table_log);
+    out.clear();
+    while (true) {
+        out.push_back(dt.symbol[s1]);
+        s1 = dt.next_state[s1] + r.read_bits_padded(dt.nb_bits[s1]);
+        if (r.bit_pos() > size * 8 || static_cast<int>(out.size()) >= max_out) {
+            out.push_back(dt.symbol[s2]);
+            break;
+        }
+        out.push_back(dt.symbol[s2]);
+        s2 = dt.next_state[s2] + r.read_bits_padded(dt.nb_bits[s2]);
+        if (r.bit_pos() > size * 8 || static_cast<int>(out.size()) >= max_out) {
+            out.push_back(dt.symbol[s1]);
+            break;
+        }
+    }
+}
+
+// Try to FSE-compress a weight sequence. Returns the body (NCount + FSE
+// stream) or an empty vector if not beneficial.
+auto fse_compress_weights(const std::vector<std::uint8_t>& weights,
+                          std::vector<std::byte>& out) -> bool {
+    const int wt_size = static_cast<int>(weights.size());
+    if (wt_size <= 2) return false;
+    std::vector<unsigned> count(256, 0);
+    int max_symbol = 0;
+    int max_count = 0;
+    for (std::uint8_t w : weights) {
+        count[w]++;
+        if (w > max_symbol) max_symbol = w;
+        if (static_cast<int>(count[w]) > max_count) max_count = count[w];
+    }
+    if (max_count == wt_size) return false;  // RLE
+    if (max_count == 1) return false;        // not compressible
+
+    const int table_log = 6;  // MAX_FSE_TABLELOG_FOR_HUFF_HEADER
+    std::vector<int> norm;
+    fse_normalize(count, wt_size, max_symbol, table_log, norm);
+
+    std::vector<std::int16_t> norm16(static_cast<std::size_t>(max_symbol) + 1);
+    for (int i = 0; i <= max_symbol; ++i) {
+        norm16[static_cast<std::size_t>(i)] =
+            static_cast<std::int16_t>(norm[static_cast<std::size_t>(i)]);
+    }
+    FseCTable ct = build_fse_ctable(table_log, norm16.data(), max_symbol);
+
+    std::vector<std::byte> body;
+    fse_write_ncount(body, norm, max_symbol, table_log);
+    FseBitWriter w;
+    fse_encode_2state(w, ct, weights.data(), wt_size);
+    const auto& bytes = w.data();
+    body.insert(body.end(), bytes.begin(), bytes.end());
+    out = std::move(body);
+    return true;
+}
+
+// Decompress an FSE weight stream.
+auto fse_decompress_weights(const std::byte* data, std::size_t size,
+                            std::vector<std::uint8_t>& out) -> bool {
+    int table_log = 0;
+    int max_symbol = 0;
+    std::vector<int> norm;
+    std::size_t consumed = 0;
+    if (!fse_read_ncount(data, size, table_log, norm, max_symbol, consumed)) {
+        return false;
+    }
+    if (consumed >= size) return false;
+    WeightDTable dt;
+    build_weight_dtable(table_log, norm, max_symbol, dt);
+    fse_decode_2state(dt, data + consumed, size - consumed, out, 255);
+    return !out.empty();
 }
 
 }  // namespace
@@ -277,17 +670,36 @@ auto huf_read_weights(const std::byte* data, std::size_t size, HufTable& t,
                       std::size_t& consumed) -> bool {
     if (size < 1) return false;
     std::uint8_t header = static_cast<std::uint8_t>(data[0]);
-    if (header < 128) return false;  // FSE-compressed weights unsupported
-    const int num_weights = header - 127;
-    const int nbytes = (num_weights + 1) / 2;
-    if (1 + static_cast<std::size_t>(nbytes) > size) return false;
-
-    std::vector<int> weights(static_cast<std::size_t>(num_weights) + 2, 0);
-    for (int n = 0; n < num_weights; n += 2) {
-        std::uint8_t b = static_cast<std::uint8_t>(data[1 + n / 2]);
-        weights[static_cast<std::size_t>(n)] = b >> 4;
-        weights[static_cast<std::size_t>(n) + 1] = b & 0xF;
+    std::vector<int> weights(258, 0);
+    int num_weights;
+    if (header < 128) {
+        // FSE-compressed weights: header is the compressed size.
+        const int csize = header;
+        if (1 + static_cast<std::size_t>(csize) > size) return false;
+        std::vector<std::uint8_t> w;
+        if (!fse_decompress_weights(data + 1, static_cast<std::size_t>(csize),
+                                    w)) {
+            return false;
+        }
+        num_weights = static_cast<int>(w.size());
+        if (num_weights < 1 || num_weights > 255) return false;
+        for (int i = 0; i < num_weights; ++i) {
+            weights[static_cast<std::size_t>(i)] = w[static_cast<std::size_t>(i)];
+        }
+        consumed = 1 + static_cast<std::size_t>(csize);
+    } else {
+        // Direct (nibble) weights.
+        num_weights = header - 127;
+        const int nbytes = (num_weights + 1) / 2;
+        if (1 + static_cast<std::size_t>(nbytes) > size) return false;
+        for (int n = 0; n < num_weights; n += 2) {
+            std::uint8_t b = static_cast<std::uint8_t>(data[1 + n / 2]);
+            weights[static_cast<std::size_t>(n)] = b >> 4;
+            weights[static_cast<std::size_t>(n) + 1] = b & 0xF;
+        }
+        consumed = 1 + static_cast<std::size_t>(nbytes);
     }
+
     int weight_total = 0;
     for (int n = 0; n < num_weights; ++n) {
         if (weights[static_cast<std::size_t>(n)] > 12) return false;
@@ -309,7 +721,6 @@ auto huf_read_weights(const std::byte* data, std::size_t size, HufTable& t,
             w > 0 ? (table_log + 1 - w) : 0;
     }
     finalize_codes(t);
-    consumed = 1 + static_cast<std::size_t>(nbytes);
     return true;
 }
 

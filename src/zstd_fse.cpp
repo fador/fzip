@@ -215,6 +215,23 @@ auto FseBitReader::peek_bits(int n) -> std::uint32_t {
     return v;
 }
 
+auto FseBitReader::read_bits_padded(int n) -> std::uint32_t {
+    std::uint32_t v = 0;
+    for (int i = 0; i < n; ++i) {
+        std::uint32_t bit = 0;
+        if (pos_ < size_ * 8) {
+            std::size_t byte_from_end = pos_ / 8;
+            std::size_t bit_from_msb = pos_ % 8;
+            std::size_t byte_idx = size_ - 1 - byte_from_end;
+            int bit_pos = 7 - static_cast<int>(bit_from_msb);
+            bit = (static_cast<std::uint8_t>(data_[byte_idx]) >> bit_pos) & 1u;
+        }
+        v = (v << 1) | bit;
+        ++pos_;
+    }
+    return v;
+}
+
 auto FseBitReader::get_state(int accuracy_log) -> std::uint32_t {
     return read_bits(accuracy_log);
 }

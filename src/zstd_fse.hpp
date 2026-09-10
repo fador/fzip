@@ -53,8 +53,15 @@ class FseBitReader {
     // the leading bits of the peeked value).
     auto peek_bits(int n) -> std::uint32_t;
 
+    // Like read_bits, but bits past the start of the stream read as 0 instead
+    // of throwing (used by the FSE weight decoder).
+    auto read_bits_padded(int n) -> std::uint32_t;
+
     // Skip `n` bits without reading.
     void skip_bits(int n) { pos_ += static_cast<std::size_t>(n); }
+
+    // Current bit position (counted from the end of the stream).
+    auto bit_pos() const -> std::size_t { return pos_; }
 
     // Get the current FSE state (initial state = first `accuracy_log` bits).
     auto get_state(int accuracy_log) -> std::uint32_t;
