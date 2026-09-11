@@ -27,9 +27,12 @@ struct CompressedEntry {
 auto compress(CodecId codec, std::span<const std::byte> data, int level,
               std::string_view hint_path) -> CompressedEntry;
 
-// Auto-select a codec for `data` based on type detection and size.
+// Auto-select a codec for `data` based on type detection, then trial-compress
+// the promising candidates and keep the smallest result. `level` selects the
+// strongest zstd level to try (>= 22 also enables the exhaustive parser).
 auto compress_auto(std::span<const std::byte> data,
-                   std::string_view hint_path) -> CompressedEntry;
+                   std::string_view hint_path, int level = 19)
+    -> CompressedEntry;
 
 // Decompress an entry back to its original bytes.
 auto decompress(const CompressedEntry& entry) -> std::vector<std::byte>;

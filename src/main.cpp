@@ -31,12 +31,14 @@ void print_usage() {
         "  fzip store <archive.zip> <files...>\n"
         "  fzip deflate <archive.zip> <files...> [--level=N]   (Stage 3)\n"
         "  fzip zstd <archive.zip> <files...> [--level=N]      (Stage 4)\n"
-        "  fzip auto <archive.zip> <files...>                  (Stage 5)\n"
+        "  fzip auto <archive.zip> <files...> [--level=N]      (Stage 5)\n"
         "\n"
         "A file argument beginning with '@' is treated as a list file: each\n"
         "line is read as one file path (e.g. '@inputs.txt').\n"
         "\n"
-        "Stage 1 implements `store` (compression method 0).\n",
+        "Levels: deflate 1-12 (9-12 use the optimal parser), zstd 1-22\n"
+        "(19-22 use the optimal parser; 10+ use a large shared window).\n"
+        "`auto` accepts --level to cap the strongest zstd level attempted.\n",
         kVersion);
 }
 
@@ -171,8 +173,9 @@ auto cmd_auto(int argc, char** argv) -> int {
         std::fprintf(stderr, "fzip auto: no input files\n");
         return 1;
     }
+    int level = parse_level(argc, argv, 19);
     auto entries = read_entries(files);
-    if (!write_zip_auto(archive, entries)) {
+    if (!write_zip_auto(archive, entries, level)) {
         std::fprintf(stderr, "fzip auto: failed to write '%s'\n", archive.c_str());
         return 1;
     }

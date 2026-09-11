@@ -77,8 +77,8 @@ auto decode_sequences(const std::byte* data, std::size_t size,
                       int num_sequences,
                       const FseSeqSymbol* litlen_table, int ll_acc,
                       const FseSeqSymbol* offset_table, int of_acc,
-                      const FseSeqSymbol* matchlen_table, int ml_acc)
-    -> std::vector<Sequence> {
+                      const FseSeqSymbol* matchlen_table, int ml_acc,
+                      RepeatOffsets& repeat) -> std::vector<Sequence> {
     if (num_sequences == 0) return {};
 
     // The FSE bitstream is written forward, read backward from the end.
@@ -97,13 +97,42 @@ auto decode_sequences(const std::byte* data, std::size_t size,
         const FseSeqSymbol& ml = matchlen_table[ml_state];
         const FseSeqSymbol& of = offset_table[of_state];
 
-        // Decoder consumes: offset extra, match-len extra, lit-len extra,
-        // then updates states LL, ML, OF.
-        if (of.nb_add_bits <= 1) {
-            throw ZstdError("repeat offset codes are not supported");
-        }
-        int offset = static_cast<int>(of.base_value) +
+        // Offset. `of.nb_add_bits` is the Offset_Code; codes 0 and 1 are
+        // repeat offsets handled exactly per RFC 8878 §3.1.1.5 (matching the
+        // reference ZSTD_decodeSequence logic).
+        int offset;
+        if (of.nb_add_bits > 1) {
+            offset = static_cast<int>(of.base_value) +
                      static_cast<int>(reader.read_bits(of.nb_add_bits));
+            repeat.offsets[2] = repeat.offsets[1];
+            repeat.offsets[1] = repeat.offsets[0];
+            repeat.offsets[0] = offset;
+        } else {
+            const int ll0 = (ll.base_value == 0) ? 1 : 0;
+            if (of.nb_add_bits == 0) {
+                // Offset_Value 1: RO1 when literals_length > 0, else RO2.
+                offset = repeat.offsets[ll0];
+                repeat.offsets[1] = repeat.offsets[ll0 ? 0 : 1];
+                repeat.offsets[0] = offset;
+            } else {
+                // Offset_Value 2 or 3.
+                const int ov = static_cast<int>(of.base_value) + ll0 +
+                               static_cast<int>(reader.read_bits(1));
+                int temp;
+                if (ov == 3) {
+                    temp = repeat.offsets[0] - 1;
+                } else {
+                    temp = repeat.offsets[ov];
+                }
+                if (temp == 0) {
+                    throw ZstdError("invalid repeat offset (resolves to 0)");
+                }
+                if (ov != 1) repeat.offsets[2] = repeat.offsets[1];
+                repeat.offsets[1] = repeat.offsets[0];
+                repeat.offsets[0] = offset = temp;
+            }
+        }
+
         int match_len = static_cast<int>(ml.base_value);
         if (ml.nb_add_bits) {
             match_len += static_cast<int>(reader.read_bits(ml.nb_add_bits));
@@ -129,12 +158,9 @@ auto decode_sequences(const std::byte* data, std::size_t size,
     return seqs;
 }
 
-auto execute_sequences(const std::vector<Sequence>& sequences,
+void execute_sequences(const std::vector<Sequence>& sequences,
                        const std::vector<std::byte>& literals,
-                       RepeatOffsets& repeat) -> std::vector<std::byte> {
-    std::vector<std::byte> out;
-    out.reserve(literals.size() * 2);
-
+                       std::vector<std::byte>& out) {
     int lit_pos = 0;
 
     for (const auto& seq : sequences) {
@@ -150,43 +176,7 @@ auto execute_sequences(const std::vector<Sequence>& sequences,
 
         // Copy match bytes.
         if (seq.match_length > 0) {
-            int offset = seq.offset;
-
-            // Resolve repeat offsets (encoded as negative values).
-            if (offset < 0) {
-                int raw_code = -(offset) - 1;  // 0, 1, 2, or 3
-                if (raw_code == 0) {
-                    // Code 0: use repeat[0], no update.
-                    offset = repeat.offsets[0];
-                } else if (raw_code == 1) {
-                    // Code 1: use repeat[1], swap repeat[0] and repeat[1].
-                    offset = repeat.offsets[1];
-                    std::swap(repeat.offsets[0], repeat.offsets[1]);
-                } else if (raw_code == 2) {
-                    // Code 2: use repeat[2], rotate repeat[].
-                    offset = repeat.offsets[2];
-                    int tmp = repeat.offsets[2];
-                    repeat.offsets[2] = repeat.offsets[1];
-                    repeat.offsets[1] = repeat.offsets[0];
-                    repeat.offsets[0] = tmp;
-                } else {
-                    // Code 3: if litlen == 0 → offset = repeat[0] - 1
-                    //          else → offset = 1
-                    if (seq.literals_length == 0) {
-                        offset = repeat.offsets[0] - 1;
-                    } else {
-                        offset = 1;
-                    }
-                    // No repeat update for code 3.
-                }
-            } else {
-                // Normal offset (code >= 4): update repeat offsets.
-                repeat.offsets[2] = repeat.offsets[1];
-                repeat.offsets[1] = repeat.offsets[0];
-                repeat.offsets[0] = offset;
-            }
-
-            // Copy match bytes (may overlap with output).
+            const int offset = seq.offset;
             if (offset <= 0 || static_cast<std::size_t>(offset) > out.size()) {
                 throw ZstdError("invalid match offset: " + std::to_string(offset));
             }
@@ -206,8 +196,6 @@ auto execute_sequences(const std::vector<Sequence>& sequences,
     if (lit_pos < static_cast<int>(literals.size())) {
         out.insert(out.end(), literals.begin() + lit_pos, literals.end());
     }
-
-    return out;
 }
 
 }  // namespace fzip::zstd

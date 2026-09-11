@@ -249,8 +249,18 @@ void seq_code_base_extra(int kind, int code, int& base, int& extra) {
         extra = litlen_code_to_extra(code);
     } else if (kind == 1) {
         // Offset: offset = ((1<<code)-3) + read(code) for code >= 2.
-        base = (code >= 2) ? static_cast<int>((1u << code) - 3u) : 0;
-        extra = (code >= 2) ? code : 0;
+        // Codes 0 and 1 are repeat offsets: code 0 has no extra bits, code 1
+        // has one (Offset_Value 2 or 3).
+        if (code == 0) {
+            base = 0;
+            extra = 0;
+        } else if (code == 1) {
+            base = 1;
+            extra = 1;
+        } else {
+            base = static_cast<int>((1u << code) - 3u);
+            extra = code;
+        }
     } else {
         base = matchlen_code_to_base(code);
         extra = matchlen_code_to_extra(code);
@@ -316,10 +326,12 @@ void build_seq_table(int mode, int kind, const std::byte*& p,
     out.acc = table_log;
 }
 
-// Decompress one compressed block.
-auto decompress_compressed_block(const std::byte* data, std::size_t size,
-                                 [[maybe_unused]] const BlockHeader& hdr)
-    -> std::vector<std::byte> {
+// Decompress one compressed block, appending to the frame-level `out` so that
+// sequences can reference data from previous blocks (and repeat offsets carry
+// across compressed blocks).
+void decompress_compressed_block(const std::byte* data, std::size_t size,
+                                 std::vector<std::byte>& out,
+                                 RepeatOffsets& repeat) {
     // Compressed block format:
     //   1. Literals section (variable size)
     //   2. Sequences section
@@ -334,15 +346,15 @@ auto decompress_compressed_block(const std::byte* data, std::size_t size,
     // Read number of sequences.
     std::size_t num_seq_consumed = 0;
     if (p >= end) {
-        // No room for sequences — treat as 0 sequences.
-        return literals;
+        out.insert(out.end(), literals.begin(), literals.end());
+        return;
     }
     int num_sequences = read_num_sequences(p, end, num_seq_consumed);
     p += num_seq_consumed;
 
     if (num_sequences == 0) {
-        // No sequences — literals only.
-        return literals;
+        out.insert(out.end(), literals.begin(), literals.end());
+        return;
     }
 
     // Symbol compression modes (bits 7-6 LL, 5-4 OF, 3-2 ML, 1-0 reserved).
@@ -361,25 +373,28 @@ auto decompress_compressed_block(const std::byte* data, std::size_t size,
     // Decode sequences from the remaining FSE bitstream.
     auto sequences = decode_sequences(p, static_cast<std::size_t>(end - p),
                                       num_sequences, ll.table, ll.acc, of.table,
-                                      of.acc, ml.table, ml.acc);
+                                      of.acc, ml.table, ml.acc, repeat);
 
-    // Execute sequences.
-    RepeatOffsets repeat;
-    return execute_sequences(sequences, literals, repeat);
+    // Execute sequences into the frame output.
+    execute_sequences(sequences, literals, out);
 }
 
-// Decompress one block (handles all block types).
-auto decompress_block(const std::byte* data, std::size_t size,
-                      const BlockHeader& hdr) -> std::vector<std::byte> {
+// Decompress one block (handles all block types), appending to `out`.
+void decompress_block(const std::byte* data, std::size_t size,
+                      const BlockHeader& hdr, std::vector<std::byte>& out,
+                      RepeatOffsets& repeat) {
     switch (hdr.type) {
         case BlockType::Raw:
             if (size < hdr.block_size) throw ZstdError("raw block truncated");
-            return std::vector<std::byte>(data, data + hdr.block_size);
+            out.insert(out.end(), data, data + hdr.block_size);
+            break;
         case BlockType::RLE:
             if (size < 1) throw ZstdError("rle block missing byte");
-            return std::vector<std::byte>(hdr.block_size, data[0]);
+            out.insert(out.end(), hdr.block_size, data[0]);
+            break;
         case BlockType::Compressed:
-            return decompress_compressed_block(data, size, hdr);
+            decompress_compressed_block(data, size, out, repeat);
+            break;
         default:
             throw ZstdError("reserved block type");
     }
@@ -416,22 +431,22 @@ auto decompress(std::span<const std::byte> data, std::size_t) -> std::vector<std
         return {};
     }
 
-    // Parse all blocks up front. fzip's blocks are independent (matches never
-    // cross block boundaries), so they can be decoded in parallel.
-    struct BlockJob {
-        const std::byte* data = nullptr;
-        std::size_t size = 0;
-        BlockHeader hdr;
-        std::vector<std::byte> decoded;
-    };
-    std::vector<BlockJob> jobs;
-    while (p < end) {
+    // Decode blocks sequentially. Repeat offsets and matches may reference
+    // data produced by earlier blocks, so blocks are not independent.
+    std::vector<std::byte> output;
+    if (!hdr.fcs_unknown && hdr.frame_content_size > 0) {
+        output.reserve(static_cast<std::size_t>(hdr.frame_content_size));
+    }
+    RepeatOffsets repeat;
+    bool last = false;
+    while (!last && p < end) {
         BlockHeader blk;
         std::size_t blk_bytes = 0;
         if (!parse_block_header(p, static_cast<std::size_t>(end - p), blk, blk_bytes)) {
             throw ZstdError("failed to parse block header");
         }
         p += blk_bytes;
+        last = blk.last_block;
 
         // A block's content is exactly `block_size` bytes (1 byte for RLE),
         // not the rest of the frame — the FSE bitstream finds its sentinel at
@@ -440,49 +455,8 @@ auto decompress(std::span<const std::byte> data, std::size_t) -> std::vector<std
         const std::size_t content_len =
             (blk.type == BlockType::RLE) ? 1 : blk.block_size;
         const std::size_t avail = static_cast<std::size_t>(end - p);
-        BlockJob job;
-        job.data = p;
-        job.size = std::min(content_len, avail);
-        job.hdr = blk;
-        jobs.push_back(std::move(job));
+        decompress_block(p, std::min(content_len, avail), blk, output, repeat);
         p += content_len;
-
-        if (blk.last_block) break;
-    }
-
-    auto decode_job = [&](BlockJob& j) {
-        j.decoded = decompress_block(j.data, j.size, j.hdr);
-    };
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 1;
-    if (jobs.size() < 2 || hw <= 1) {
-        for (BlockJob& j : jobs) {
-            decode_job(j);
-        }
-    } else {
-        const unsigned nw =
-            std::min<unsigned>(hw, static_cast<unsigned>(jobs.size()));
-        std::atomic<std::size_t> next{0};
-        std::vector<std::thread> workers;
-        workers.reserve(nw);
-        for (unsigned t = 0; t < nw; ++t) {
-            workers.emplace_back([&]() {
-                for (;;) {
-                    std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                    if (i >= jobs.size()) break;
-                    decode_job(jobs[i]);
-                }
-            });
-        }
-        for (auto& worker : workers) worker.join();
-    }
-
-    std::vector<std::byte> output;
-    if (!hdr.fcs_unknown && hdr.frame_content_size > 0) {
-        output.reserve(static_cast<std::size_t>(hdr.frame_content_size));
-    }
-    for (const BlockJob& j : jobs) {
-        output.insert(output.end(), j.decoded.begin(), j.decoded.end());
     }
 
     if (hdr.content_checksum) {

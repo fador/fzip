@@ -64,28 +64,31 @@ auto compress(CodecId codec, std::span<const std::byte> data, int level,
 }
 
 auto compress_auto(std::span<const std::byte> data,
-                   std::string_view hint_path) -> CompressedEntry {
+                   std::string_view hint_path, int level) -> CompressedEntry {
     auto ftype = detect_file_type(hint_path, data);
 
-    switch (ftype) {
-        case FileType::Incompressible:
-            // Already compressed — Store.
-            return compress_with(CodecId::Store, data, 0, hint_path);
-
-        case FileType::Executable:
-            // Executables: zstd-19 (ratio now on par with deflate, faster
-            // decode).
-            return compress_with(CodecId::Zstd, data, 19, hint_path);
-
-        case FileType::Text:
-            // Text/XML/JSON/source: zstd-19 for maximum ratio.
-            return compress_with(CodecId::Zstd, data, 19, hint_path);
-
-        case FileType::Binary:
-        default:
-            // General binary: zstd-19.
-            return compress_with(CodecId::Zstd, data, 19, hint_path);
+    // Already-compressed formats never benefit (and Store is a hard cost
+    // floor for everything else). Skip the trial pass entirely.
+    if (ftype == FileType::Incompressible) {
+        return compress_with(CodecId::Store, data, 0, hint_path);
     }
+
+    // Trial-compress the candidates and keep the smallest payload. Store is
+    // the guaranteed bound, so the result is never worse than either codec.
+    // Deflate at its top level handles small/structured data well; zstd wins
+    // on larger or more redundant inputs.
+    CompressedEntry best = compress_with(CodecId::Store, data, 0, hint_path);
+
+    auto consider = [&](CompressedEntry&& cand) {
+        if (cand.data.size() < best.data.size()) {
+            best = std::move(cand);
+        }
+    };
+
+    consider(compress_with(CodecId::Deflate, data, 9, hint_path));
+    consider(compress_with(CodecId::Zstd, data, level, hint_path));
+
+    return best;
 }
 
 auto decompress(const CompressedEntry& entry) -> std::vector<std::byte> {

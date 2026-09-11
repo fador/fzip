@@ -54,6 +54,23 @@ class BitWriter {
         return std::span<const std::byte>{out_.data(), out_.size()};
     }
     auto size() const -> std::size_t { return out_.size(); }
+    auto total_bits() const -> std::size_t {
+        return out_.size() * 8 + static_cast<std::size_t>(acc_bits_);
+    }
+
+    // Snapshot/rollback so a block can be emitted speculatively (to compare
+    // dynamic / fixed / stored encodings) and then re-emitted for real.
+    struct Mark {
+        std::size_t out_size;
+        std::uint32_t acc;
+        int acc_bits;
+    };
+    auto mark() const -> Mark { return {out_.size(), acc_, acc_bits_}; }
+    void restore(const Mark& m) {
+        out_.resize(m.out_size);
+        acc_ = m.acc;
+        acc_bits_ = m.acc_bits;
+    }
 
   private:
     std::vector<std::byte> out_;
@@ -271,9 +288,18 @@ auto build_huff_lengths(const std::array<std::uint32_t, N>& freqs,
 constexpr int kWindow = 32768;
 constexpr int kMinMatch = 3;
 constexpr int kMaxMatch = 258;
-constexpr int kHashBits = 15;
+constexpr int kHashBits = 16;
 constexpr int kHashSize = 1 << kHashBits;
 constexpr std::uint32_t kHashMask = kHashSize - 1;
+
+inline auto hash4(const std::uint8_t* p) -> std::uint32_t {
+    // Mix four bytes into the hash table size.
+    std::uint32_t v = static_cast<std::uint32_t>(p[0]) |
+                      (static_cast<std::uint32_t>(p[1]) << 8) |
+                      (static_cast<std::uint32_t>(p[2]) << 16) |
+                      (static_cast<std::uint32_t>(p[3]) << 24);
+    return (v * 2654435761u) >> (32 - kHashBits);
+}
 
 inline auto hash3(const std::uint8_t* p) -> std::uint32_t {
     // Mix three bytes into a 15-bit hash.
@@ -328,6 +354,16 @@ void insert_hash(const std::uint8_t* data, std::size_t size, std::size_t pos,
                  std::vector<int>& head, std::vector<int>& prev) {
     if (pos + kMinMatch > size) return;
     std::uint32_t h = hash3(data + pos);
+    int p = static_cast<int>(pos);
+    prev[p & (kWindow - 1)] = head[h];
+    head[h] = p;
+}
+
+// Insert `pos` into the 4-byte hash chain.
+void insert_hash4(const std::uint8_t* data, std::size_t size, std::size_t pos,
+                  std::vector<int>& head, std::vector<int>& prev) {
+    if (pos + 4 > size) return;
+    std::uint32_t h = hash4(data + pos);
     int p = static_cast<int>(pos);
     prev[p & (kWindow - 1)] = head[h];
     head[h] = p;
@@ -493,6 +529,232 @@ auto distance_to_symbol(int dist) -> int {
     return distance_code(dist).sym;
 }
 
+// One candidate match for the optimal parser.
+struct MatchCand {
+    int len;
+    int dist;
+};
+
+// Maximum Pareto candidates kept per position: closer matches (cheaper
+// distance codes) versus longer matches.
+constexpr int kMaxCands = 6;
+
+// Collect Pareto-optimal matches at `pos` into `out` (capacity kMaxCands):
+// matches for which no other match is both at least as long and at least as
+// close. `out` ends up sorted by increasing distance (and length). Two hash
+// chains (3-byte and 4-byte prefixes) are searched; the 4-byte chain finds
+// long matches quickly while the 3-byte chain covers length-3 matches.
+auto find_match_candidates(const std::uint8_t* data, std::size_t size,
+                           std::size_t pos, const std::vector<int>& head3,
+                           const std::vector<int>& prev3,
+                           const std::vector<int>& head4,
+                           const std::vector<int>& prev4, int effort,
+                           MatchCand (&out)[kMaxCands]) -> int {
+    int n = 0;
+    if (pos + kMinMatch > size) return 0;
+    const int maxl = static_cast<int>(std::min<std::size_t>(
+        static_cast<std::size_t>(kMaxMatch), size - pos));
+    const int limit = (pos > kWindow) ? static_cast<int>(pos) - kWindow : 0;
+    int best_len = 0;
+
+    // Update the Pareto set with a candidate at absolute position `cand`.
+    // Returns false if the candidate is out of window (caller should stop).
+    auto consider = [&](int cand) -> bool {
+        if (cand < limit) return false;
+        const int d = static_cast<int>(pos) - cand;
+        int l = 0;
+        while (l < maxl && data[cand + l] == data[pos + l]) ++l;
+        if (l >= kMinMatch) {
+            if (l > best_len) best_len = l;
+            bool dominated = false;
+            for (int j = 0; j < n; ++j) {
+                if (out[j].dist <= d && out[j].len >= l) {
+                    dominated = true;
+                    break;
+                }
+            }
+            if (!dominated) {
+                int w = 0;
+                for (int j = 0; j < n; ++j) {
+                    if (!(out[j].dist >= d && out[j].len <= l)) {
+                        out[w++] = out[j];
+                    }
+                }
+                n = w;
+                if (n < kMaxCands) {
+                    int ins = 0;
+                    while (ins < n && out[ins].dist < d) ++ins;
+                    for (int j = n; j > ins; --j) out[j] = out[j - 1];
+                    out[ins] = MatchCand{l, d};
+                    ++n;
+                }
+            }
+            if (l >= maxl || n >= kMaxCands) return false;
+        }
+        return true;
+    };
+
+    // 4-byte chain first (longer matches).
+    {
+        int cand = head4[hash4(data + pos)];
+        int tries = effort;
+        while (cand >= 0 && tries-- > 0) {
+            if (!consider(cand)) break;
+            cand = prev4[static_cast<std::size_t>(cand) & (kWindow - 1)];
+        }
+    }
+    // 3-byte chain.
+    {
+        int cand = head3[hash3(data + pos)];
+        int tries = effort;
+        while (cand >= 0 && tries-- > 0) {
+            if (!consider(cand)) break;
+            cand = prev3[static_cast<std::size_t>(cand) & (kWindow - 1)];
+        }
+    }
+    return n;
+}
+
+// --------------------------------------------------------------------------
+// Optimal (shortest-path) LZ77 parse with iterative Huffman cost feedback.
+// A forward pass records the longest match at every position; a backward DP
+// then picks the cheapest token sequence. Symbol costs come from the Huffman
+// code lengths rebuilt from the previous parse, repeated `iterations` times
+// (Zopfli-style). Levels that use this pay a large time cost for ratio.
+// --------------------------------------------------------------------------
+auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
+                  int iterations, std::array<std::uint32_t, 288>& lit_freq,
+                  std::array<std::uint32_t, 32>& dist_freq)
+    -> std::vector<Token> {
+    lit_freq.fill(0);
+    dist_freq.fill(0);
+    const int N = static_cast<int>(size);
+    if (N <= 0) {
+        lit_freq[256]++;
+        return {};
+    }
+
+    // Forward pass: Pareto-optimal matches at every position, stored in a
+    // shared pool indexed by `cand_start`.
+    std::vector<MatchCand> pool;
+    pool.reserve(static_cast<std::size_t>(N));
+    std::vector<int> cand_start(static_cast<std::size_t>(N) + 1, 0);
+    {
+        std::vector<int> head3(kHashSize, -1);
+        std::vector<int> prev3(kWindow, -1);
+        std::vector<int> head4(kHashSize, -1);
+        std::vector<int> prev4(kWindow, -1);
+        for (int p = 0; p < N; ++p) {
+            cand_start[static_cast<std::size_t>(p)] =
+                static_cast<int>(pool.size());
+            MatchCand local[kMaxCands];
+            const int nc = find_match_candidates(
+                data, size, static_cast<std::size_t>(p), head3, prev3, head4,
+                prev4, effort, local);
+            for (int j = 0; j < nc; ++j) pool.push_back(local[j]);
+            const std::size_t up = static_cast<std::size_t>(p);
+            insert_hash(data, size, up, head3, prev3);
+            insert_hash4(data, size, up, head4, prev4);
+        }
+        cand_start[static_cast<std::size_t>(N)] =
+            static_cast<int>(pool.size());
+    }
+
+    // Seed frequencies with a greedy parse using the longest candidate.
+    for (int p = 0; p < N;) {
+        const int end_ci = cand_start[static_cast<std::size_t>(p) + 1];
+        const int start_ci = cand_start[static_cast<std::size_t>(p)];
+        if (end_ci > start_ci) {
+            const MatchCand& best = pool[static_cast<std::size_t>(end_ci - 1)];
+            lit_freq[257 + length_to_symbol(best.len)]++;
+            dist_freq[distance_to_symbol(best.dist)]++;
+            p += best.len;
+        } else {
+            lit_freq[data[p]]++;
+            ++p;
+        }
+    }
+    lit_freq[256]++;
+
+    std::vector<int> choice_len(static_cast<std::size_t>(N), 1);
+    std::vector<int> choice_dist(static_cast<std::size_t>(N), 0);
+    std::vector<double> dp(static_cast<std::size_t>(N) + 1, 0.0);
+    std::vector<Token> tokens;
+
+    if (iterations < 1) iterations = 1;
+    constexpr int kUnusedCost = 15;  // max code length: avoid unused symbols
+    for (int it = 0; it < iterations; ++it) {
+        auto lit_lens = build_huff_lengths(lit_freq, 286, 15);
+        std::array<std::uint32_t, 32> df{};
+        for (int i = 0; i < 30; ++i) df[i] = dist_freq[i];
+        auto dist_lens = build_huff_lengths(df, 30, 15);
+
+        dp[static_cast<std::size_t>(N)] = 0.0;
+        for (int i = N - 1; i >= 0; --i) {
+            int lit_bits = lit_lens[data[i]];
+            if (lit_bits == 0) lit_bits = kUnusedCost;
+            double best = lit_bits + dp[static_cast<std::size_t>(i) + 1];
+            int bl = 1;
+            int bd = 0;
+            // Walk Pareto candidates by increasing distance; candidate k
+            // covers lengths not covered by a closer candidate.
+            const int ci_begin = cand_start[static_cast<std::size_t>(i)];
+            const int ci_end = cand_start[static_cast<std::size_t>(i) + 1];
+            int prev_len = kMinMatch - 1;
+            for (int ci = ci_begin; ci < ci_end; ++ci) {
+                const MatchCand& c = pool[static_cast<std::size_t>(ci)];
+                const int d = c.dist;
+                const int max_l = std::min(c.len, kMaxMatch);
+                if (max_l <= prev_len) continue;
+                const int dsym = distance_to_symbol(d);
+                int dbits = dist_lens[dsym];
+                if (dbits == 0) dbits = kUnusedCost;
+                dbits += distance_code(d).extra;
+                for (int L = prev_len + 1; L <= max_l; ++L) {
+                    auto lc = length_code(L);
+                    int lbits = lit_lens[lc.sym];
+                    if (lbits == 0) lbits = kUnusedCost;
+                    double cst = lbits + lc.extra + dbits +
+                                 dp[static_cast<std::size_t>(i + L)];
+                    if (cst < best) {
+                        best = cst;
+                        bl = L;
+                        bd = d;
+                    }
+                }
+                prev_len = max_l;
+                if (prev_len >= kMaxMatch) break;
+            }
+            dp[static_cast<std::size_t>(i)] = best;
+            choice_len[static_cast<std::size_t>(i)] = bl;
+            choice_dist[static_cast<std::size_t>(i)] = bd;
+        }
+
+        // Reconstruct the token stream and recompute symbol frequencies.
+        lit_freq.fill(0);
+        dist_freq.fill(0);
+        tokens.clear();
+        for (int p = 0; p < N;) {
+            const int L = choice_len[static_cast<std::size_t>(p)];
+            if (L <= 1) {
+                Token t{false, data[p], 0, 0};
+                tokens.push_back(t);
+                lit_freq[data[p]]++;
+                ++p;
+            } else {
+                const int d = choice_dist[static_cast<std::size_t>(p)];
+                Token t{true, 0, L, d};
+                tokens.push_back(t);
+                lit_freq[257 + length_to_symbol(L)]++;
+                dist_freq[distance_to_symbol(d)]++;
+                p += L;
+            }
+        }
+        lit_freq[256]++;
+    }
+    return tokens;
+}
+
 // --------------------------------------------------------------------------
 // Block emission.
 // --------------------------------------------------------------------------
@@ -510,6 +772,23 @@ void emit_stored_block(BitWriter& w, bool final,
     w.put_bytes(std::span<const std::byte>{
         reinterpret_cast<const std::byte*>(&nlen), 2});
     w.put_bytes(block);
+}
+
+// Emit a run of stored blocks (BTYPE=00) for up to a full block of input,
+// splitting into <= 65535-byte chunks (the LEN field is 16-bit). Only the
+// very last chunk of the very last block is marked final.
+void emit_stored_blocks(BitWriter& w, bool final, const std::uint8_t* data,
+                        std::size_t len) {
+    std::size_t pos = 0;
+    while (pos < len) {
+        std::size_t chunk = std::min<std::size_t>(65535, len - pos);
+        bool last = (pos + chunk == len);
+        emit_stored_block(
+            w, final && last,
+            std::span<const std::byte>{
+                reinterpret_cast<const std::byte*>(data + pos), chunk});
+        pos += chunk;
+    }
 }
 
 // Emit all tokens using fixed Huffman codes (BTYPE=01).
@@ -727,7 +1006,19 @@ auto deflate_compress(std::span<const std::byte> data, int level)
         return std::vector<std::byte>{w.data().begin(), w.data().end()};
     }
     if (level < 1) level = 1;
-    if (level > 9) level = 9;
+    if (level > 12) level = 12;
+
+    // Levels 9-12 use the optimal parser; the higher the level, the more
+    // Huffman-cost refinement iterations (and match-finder effort).
+    const bool use_optimal = (level >= 9);
+    int opt_effort = 1024;
+    int opt_iterations = 2;
+    switch (level) {
+        case 10: opt_effort = 2048; opt_iterations = 3; break;
+        case 11: opt_effort = 4096; opt_iterations = 4; break;
+        case 12: opt_effort = 8192; opt_iterations = 6; break;
+        default: break;
+    }
 
     BitWriter w;
     const auto* p = reinterpret_cast<const std::uint8_t*>(data.data());
@@ -763,8 +1054,14 @@ auto deflate_compress(std::span<const std::byte> data, int level)
         }
 
         auto tokenize = [&](BlockJob& job) {
-            job.tokens = lz77_encode(p + job.off, job.len, level, job.lit_freq,
-                                     job.dist_freq);
+            if (use_optimal) {
+                job.tokens = lz77_optimal(p + job.off, job.len, opt_effort,
+                                          opt_iterations, job.lit_freq,
+                                          job.dist_freq);
+            } else {
+                job.tokens = lz77_encode(p + job.off, job.len, level,
+                                         job.lit_freq, job.dist_freq);
+            }
         };
         if (wave.size() < 2 || hw <= 1) {
             for (BlockJob& job : wave) {
@@ -790,11 +1087,48 @@ auto deflate_compress(std::span<const std::byte> data, int level)
         }
 
         for (const BlockJob& job : wave) {
+            const auto* block_data = p + job.off;
+            const std::size_t base_bits = w.total_bits();
+            const auto base = w.mark();
+            int best_mode = 1;  // 0 = dynamic, 1 = fixed, 2 = stored
+            std::size_t best_bits = static_cast<std::size_t>(-1);
+
+            // Try dynamic Huffman (worth it from level 4 up).
             if (level >= 4) {
                 emit_dynamic_block(w, job.final, job.tokens, job.lit_freq,
                                    job.dist_freq);
-            } else {
-                emit_fixed_block(w, job.final, job.tokens);
+                best_bits = w.total_bits() - base_bits;
+                best_mode = 0;
+                w.restore(base);
+            }
+
+            // Try fixed Huffman.
+            emit_fixed_block(w, job.final, job.tokens);
+            if (w.total_bits() - base_bits < best_bits) {
+                best_bits = w.total_bits() - base_bits;
+                best_mode = 1;
+            }
+            w.restore(base);
+
+            // Try stored (never expands beyond a small header).
+            emit_stored_blocks(w, job.final, block_data, job.len);
+            if (w.total_bits() - base_bits < best_bits) {
+                best_bits = w.total_bits() - base_bits;
+                best_mode = 2;
+            }
+            w.restore(base);
+
+            switch (best_mode) {
+                case 0:
+                    emit_dynamic_block(w, job.final, job.tokens, job.lit_freq,
+                                       job.dist_freq);
+                    break;
+                case 1:
+                    emit_fixed_block(w, job.final, job.tokens);
+                    break;
+                default:
+                    emit_stored_blocks(w, job.final, block_data, job.len);
+                    break;
             }
         }
     }

@@ -489,11 +489,11 @@ auto write_store_zip(const std::string& archive_path,
 }
 
 auto write_zip_auto(const std::string& archive_path,
-                    const std::vector<ZipEntry>& entries) -> bool {
+                    const std::vector<ZipEntry>& entries, int level) -> bool {
     return write_zip_impl(
         archive_path, entries,
-        [](std::span<const std::byte> data, std::string_view name) {
-            return compress_auto(data, name);
+        [level](std::span<const std::byte> data, std::string_view name) {
+            return compress_auto(data, name, level);
         });
 }
 

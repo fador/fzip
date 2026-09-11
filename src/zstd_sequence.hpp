@@ -25,20 +25,23 @@ struct RepeatOffsets {
 // Decode all sequences in a compressed block. The sequences use 3 interleaved
 // FSE streams (literals length, offset code, match length). Each stream's
 // table and accuracy log are provided by the caller (predefined, RLE, or a
-// per-block FSE table). Returns the list of sequences.
+// per-block FSE table). `repeat` carries the three repeat offsets across
+// blocks within a frame; repeat offset codes are resolved here and the state
+// is updated exactly as the reference zstd decoder does.
 auto decode_sequences(const std::byte* data, std::size_t size,
                       int num_sequences,
                       const FseSeqSymbol* litlen_table, int ll_acc,
                       const FseSeqSymbol* offset_table, int of_acc,
-                      const FseSeqSymbol* matchlen_table, int ml_acc)
-    -> std::vector<Sequence>;
+                      const FseSeqSymbol* matchlen_table, int ml_acc,
+                      RepeatOffsets& repeat) -> std::vector<Sequence>;
 
-// Execute a sequence: copy `literals_length` literal bytes, then copy
-// `match_length` bytes from `offset` bytes back in the output.
-// Returns the produced bytes (literals + match copies).
-auto execute_sequences(const std::vector<Sequence>& sequences,
+// Execute sequences into `out`: copy `literals_length` literal bytes, then
+// copy `match_length` bytes from `offset` bytes back. `out` may already
+// contain previously decoded blocks, so matches can reference them.
+// Trailing literals after the last sequence are appended.
+void execute_sequences(const std::vector<Sequence>& sequences,
                        const std::vector<std::byte>& literals,
-                       RepeatOffsets& repeat) -> std::vector<std::byte>;
+                       std::vector<std::byte>& out);
 
 // Length code tables (RFC 8878 §4.2.2).
 // Map a length code (0..35 for litlen, 0..52 for matchlen) to:

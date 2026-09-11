@@ -100,6 +100,10 @@ def make_corpus(workdir: Path) -> list[tuple[str, int]]:
     """Create test corpus files. Returns list of (filename, size)."""
     corpus_dir = workdir / "corpus"
     corpus_dir.mkdir(parents=True, exist_ok=True)
+    return _make_synthetic_corpus(corpus_dir)
+
+
+def _make_synthetic_corpus(corpus_dir: Path) -> list[tuple[str, int]]:
 
     files = [
         ("text_4k.txt", 4 * 1024, generate_text),
@@ -119,6 +123,34 @@ def make_corpus(workdir: Path) -> list[tuple[str, int]]:
         if not p.exists():
             p.write_bytes(gen(size))
         result.append((name, size))
+    return result
+
+
+def use_real_corpus(workdir: Path, src_dir: Path,
+                    max_files: int) -> list[tuple[str, int]]:
+    """Copy up to `max_files` files from `src_dir` into the corpus dir.
+
+    Files are flattened with an index prefix to avoid basename collisions.
+    Returns the list of (filename, size)."""
+    corpus_dir = workdir / "corpus"
+    if corpus_dir.exists():
+        shutil.rmtree(corpus_dir)
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+
+    candidates = sorted(p for p in src_dir.rglob("*") if p.is_file())
+    # Prefer larger, more representative files first.
+    candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+    result: list[tuple[str, int]] = []
+    for i, p in enumerate(candidates[:max_files]):
+        try:
+            data = p.read_bytes()
+        except OSError:
+            continue
+        if not data:
+            continue
+        name = f"{i:04d}_{p.name}"
+        (corpus_dir / name).write_bytes(data)
+        result.append((name, len(data)))
     return result
 
 
@@ -215,13 +247,22 @@ def main() -> int:
     ap.add_argument("--seven-zip", type=Path, default=None,
                     help="Path to 7za.exe (default: tests/7za.exe)")
     ap.add_argument("--workdir", type=Path, default=Path("bench/tmp"))
+    ap.add_argument("--corpus-dir", type=Path, default=None,
+                    help="Use real files from this directory instead of the "
+                         "synthetic corpus (recursively, flattened, up to "
+                         "--max-files).")
+    ap.add_argument("--max-files", type=int, default=64)
     args = ap.parse_args()
 
     if args.seven_zip is None:
         args.seven_zip = Path(__file__).resolve().parent.parent / "tests" / "7za.exe"
 
     args.workdir.mkdir(parents=True, exist_ok=True)
-    corpus_files = make_corpus(args.workdir)
+    if args.corpus_dir is not None:
+        corpus_files = use_real_corpus(args.workdir, args.corpus_dir,
+                                       args.max_files)
+    else:
+        corpus_files = make_corpus(args.workdir)
     corpus_dir = args.workdir / "corpus"
     total_input = sum(sz for _, sz in corpus_files)
 
