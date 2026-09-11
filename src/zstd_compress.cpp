@@ -500,32 +500,69 @@ void put_literals_header(std::vector<std::byte>& out, int type, int size_format,
     }
 }
 
-// Emit the literals section, choosing Huffman (Compressed), RLE, or Raw.
+// Size-field width (k) for a compressed/treeless literals section.
+auto literals_k(int regen, int csize) -> int {
+    const int m = std::max(regen, csize);
+    if (m <= 1023) return 10;
+    if (m <= 16383) return 14;
+    return 18;
+}
+
+// Emit the literals section, choosing Huffman (Compressed), reused-table
+// Huffman (Treeless), RLE, or Raw — whichever is smallest. `prev_t` carries
+// the last Huffman table across blocks and is updated when a new table is
+// emitted.
 void emit_literals(std::vector<std::byte>& out,
-                   const std::vector<std::uint8_t>& lits) {
+                   const std::vector<std::uint8_t>& lits, HufTable* prev_t) {
     const int n = static_cast<int>(lits.size());
 
-    // Try Huffman-coded literals (4-stream).
+    // Try Huffman-coded literals (4-stream): a fresh table (Compressed) and,
+    // when available, reusing the previous table (Treeless).
     if (n >= 64) {
-        std::vector<std::byte> body;
-        if (huf_compress_literals(lits.data(), n, body)) {
-            const int m = std::max(n, static_cast<int>(body.size()));
-            int size_format;
-            int k;
-            if (m <= 1023) {
-                size_format = 1; k = 10;
-            } else if (m <= 16383) {
-                size_format = 2; k = 14;
-            } else {
-                size_format = 3; k = 18;
+        HufTable new_t;
+        std::vector<std::byte> new_body;
+        const bool have_new = huf_literals_table(lits.data(), n, new_t) &&
+                              huf_encode_with_table(new_t, lits.data(), n,
+                                                    new_body);
+
+        std::vector<std::byte> reuse_body;
+        const bool have_reuse =
+            (prev_t != nullptr && prev_t->table_log != 0) &&
+            huf_encode_streams(*prev_t, lits.data(), n, reuse_body);
+
+        int best_type = 0;
+        int best_k = 0;
+        std::size_t best_total = static_cast<std::size_t>(-1);
+        if (have_new) {
+            const int k = literals_k(n, static_cast<int>(new_body.size()));
+            const std::size_t total =
+                new_body.size() + static_cast<std::size_t>((4 + 2 * k) / 8);
+            if (total < best_total) {
+                best_total = total;
+                best_type = 2;
+                best_k = k;
             }
-            const int hdr_bytes = (4 + 2 * k) / 8;
-            if (static_cast<int>(body.size()) + hdr_bytes < n) {
-                put_literals_header(out, 2, size_format, n,
-                                    static_cast<int>(body.size()), k);
-                out.insert(out.end(), body.begin(), body.end());
-                return;
+        }
+        if (have_reuse) {
+            const int k = literals_k(n, static_cast<int>(reuse_body.size()));
+            const std::size_t total =
+                reuse_body.size() + static_cast<std::size_t>((4 + 2 * k) / 8);
+            if (total < best_total) {
+                best_total = total;
+                best_type = 3;
+                best_k = k;
             }
+        }
+
+        if (best_type != 0 && best_total < static_cast<std::size_t>(n)) {
+            const auto& body = (best_type == 2) ? new_body : reuse_body;
+            const int size_format =
+                (best_k == 10) ? 1 : (best_k == 14) ? 2 : 3;
+            put_literals_header(out, best_type, size_format, n,
+                                static_cast<int>(body.size()), best_k);
+            out.insert(out.end(), body.begin(), body.end());
+            if (best_type == 2 && prev_t != nullptr) *prev_t = new_t;
+            return;
         }
     }
 
@@ -577,13 +614,41 @@ struct SeqStream {
     std::vector<std::byte> desc;  // NCount table description (mode 2)
 };
 
-auto make_seq_stream(const int* freq, int max_code, int max_log, int n,
+// Exact number of FSE bits the encoder will emit for `syms` with `ct`,
+// replicating emit_sequences' order (init with the last symbol, encode
+// n-2..0, then flush the final state). Extra bits are table-independent.
+auto fse_encoded_bits(const FseCTable& ct, const int* syms, int n)
+    -> long long {
+    if (n <= 0) return 0;
+    if (n == 1) return ct.table_log;
+    std::uint32_t value = fse_init_cstate2(ct, syms[n - 1]);
+    long long bits = 0;
+    for (int i = n - 2; i >= 0; --i) {
+        const std::uint32_t d = ct.delta_nb_bits[syms[i]];
+        const std::uint32_t nb = (value + d) >> 16;
+        bits += nb;
+        const int idx =
+            static_cast<int>(value >> nb) + ct.delta_find_state[syms[i]];
+        value = ct.state_table[static_cast<std::size_t>(idx)];
+    }
+    bits += ct.table_log;  // final state
+    return bits;
+}
+
+// Build a sequence FSE stream. Picks RLE / predefined / inline FSE, and for
+// inline tables searches the accuracy log to minimize the table description
+// plus the exact encoded stream size.
+auto make_seq_stream(const int* syms, int n, int max_code, int max_log,
                      const FseCTable& predef) -> SeqStream {
     SeqStream s;
+    std::vector<unsigned> counts(static_cast<std::size_t>(max_code) + 1, 0);
+    for (int i = 0; i < n; ++i) {
+        counts[static_cast<std::size_t>(syms[i])]++;
+    }
     int present = 0;
     int only = 0;
     for (int c = 0; c <= max_code; ++c) {
-        if (freq[c] > 0) {
+        if (counts[static_cast<std::size_t>(c)] > 0) {
             ++present;
             only = c;
         }
@@ -594,25 +659,39 @@ auto make_seq_stream(const int* freq, int max_code, int max_log, int n,
         return s;
     }
     if (n < 32) {
-        s.mode = 0;  // predefined (table description would cost more)
+        s.mode = 0;  // predefined (a table description would cost more)
         s.ct = predef;
         return s;
     }
+
     s.mode = 2;  // inline FSE table
-    std::vector<unsigned> counts(static_cast<std::size_t>(max_code) + 1);
-    for (int c = 0; c <= max_code; ++c) {
-        counts[static_cast<std::size_t>(c)] =
-            static_cast<unsigned>(freq[c]);
+    // Searching the accuracy log pays off when the sample is small enough for
+    // a shorter table description to win; large blocks are well-estimated by
+    // the maximum table, so skip the search there to avoid extra work.
+    int min_log = (n <= 2048) ? 5 : max_log;
+    while ((1 << min_log) < present) ++min_log;
+    if (min_log > max_log) min_log = max_log;
+    long long best_bits = (1LL << 62);
+    for (int log = min_log; log <= max_log; ++log) {
+        std::vector<int> norm;
+        fse_normalize(counts.data(), n, max_code, log, norm);
+        std::vector<std::int16_t> norm16(static_cast<std::size_t>(max_code) + 1);
+        for (int c = 0; c <= max_code; ++c) {
+            norm16[static_cast<std::size_t>(c)] =
+                static_cast<std::int16_t>(norm[static_cast<std::size_t>(c)]);
+        }
+        FseCTable ct = build_fse_ctable(log, norm16.data(), max_code);
+        std::vector<std::byte> desc;
+        fse_write_ncount(desc, norm.data(), max_code, log);
+        const long long bits =
+            static_cast<long long>(desc.size()) * 8 +
+            fse_encoded_bits(ct, syms, n);
+        if (bits < best_bits) {
+            best_bits = bits;
+            s.ct = ct;
+            s.desc = std::move(desc);
+        }
     }
-    std::vector<int> norm;
-    fse_normalize(counts.data(), n, max_code, max_log, norm);
-    std::vector<std::int16_t> norm16(static_cast<std::size_t>(max_code) + 1);
-    for (int c = 0; c <= max_code; ++c) {
-        norm16[static_cast<std::size_t>(c)] =
-            static_cast<std::int16_t>(norm[static_cast<std::size_t>(c)]);
-    }
-    s.ct = build_fse_ctable(max_log, norm16.data(), max_code);
-    fse_write_ncount(s.desc, norm.data(), max_code, max_log);
     return s;
 }
 
@@ -647,26 +726,22 @@ void emit_sequences(std::vector<std::byte>& out, const std::vector<Seq>& seqs,
     // Precompute codes and per-block frequencies. Offset codes are chosen in
     // sequence order (tracking repeat offsets) so rep codes 0/1 can be used.
     std::vector<int> llc(static_cast<std::size_t>(n));
+    std::vector<int> ofc(static_cast<std::size_t>(n));
     std::vector<int> mlc(static_cast<std::size_t>(n));
     std::vector<Code> ofcodes(static_cast<std::size_t>(n));
-    int ll_freq[36] = {0};
-    int of_freq[32] = {0};
-    int ml_freq[53] = {0};
     RepeatOffsets rep_next = rep;
     for (int i = 0; i < n; ++i) {
         const Seq& s = seqs[static_cast<std::size_t>(i)];
         llc[static_cast<std::size_t>(i)] = lit_len_code(s.lit_len).code;
         ofcodes[static_cast<std::size_t>(i)] =
             choose_offset(s.match_dist, s.lit_len, rep_next);
+        ofc[static_cast<std::size_t>(i)] = ofcodes[static_cast<std::size_t>(i)].code;
         mlc[static_cast<std::size_t>(i)] = match_len_code(s.match_len).code;
-        ll_freq[llc[static_cast<std::size_t>(i)]]++;
-        of_freq[ofcodes[static_cast<std::size_t>(i)].code]++;
-        ml_freq[mlc[static_cast<std::size_t>(i)]]++;
     }
     rep = rep_next;
-    SeqStream ll = make_seq_stream(ll_freq, 35, 9, n, ll_ctable());
-    SeqStream of = make_seq_stream(of_freq, 31, 8, n, of_ctable());
-    SeqStream ml = make_seq_stream(ml_freq, 52, 9, n, ml_ctable());
+    SeqStream ll = make_seq_stream(llc.data(), n, 35, 9, ll_ctable());
+    SeqStream of = make_seq_stream(ofc.data(), n, 31, 8, of_ctable());
+    SeqStream ml = make_seq_stream(mlc.data(), n, 52, 9, ml_ctable());
 
     // Symbol compression modes + table descriptions (LL, OF, ML order).
     out.push_back(static_cast<std::byte>((ll.mode << 6) | (of.mode << 4) |
@@ -850,19 +925,22 @@ auto compress(std::span<const std::byte> data, int level,
         }
     }
 
-    // Emit blocks in order, threading the repeat-offset state through the
-    // compressed ones.
+    // Emit blocks in order, threading the repeat-offset state and the literal
+    // Huffman table through the compressed ones.
     RepeatOffsets repeat;
+    HufTable prev_huf;
     for (Block& b : blocks) {
         if (!b.seqs.empty()) {
             std::vector<std::byte> content;
-            emit_literals(content, b.literals);
+            HufTable trial_huf = prev_huf;
+            emit_literals(content, b.literals, &trial_huf);
             RepeatOffsets trial = repeat;
             emit_sequences(content, b.seqs, trial);
             if (content.size() < b.len) {
                 b.content = std::move(content);
                 b.compressed = true;
                 repeat = trial;
+                prev_huf = std::move(trial_huf);
             }
         }
 

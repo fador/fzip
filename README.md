@@ -22,14 +22,16 @@ A state-of-the-art ZIP compressor in C++20, built to benchmark against
     streams), full frame/block parsing. It is **sequential per frame** so
     repeat offsets and matches carry across blocks.
   - **Compressor**: emits spec-correct **compressed blocks** — literals are
-    Huffman-coded (4-stream, with FSE- or direct-encoded weight tables) when
-    beneficial, otherwise RLE/raw, and sequences are FSE-coded with
-    **per-block tables** (RLE for single-symbol streams, predefined for tiny
-    blocks). It emits **repeat-offset codes** (rep 1-3), uses a **shared
-    window up to 8 MiB** so matches can reference previous blocks at higher
-    levels, and uses a **multi-pass optimal (shortest-path) parser** at the
-    top levels. Frame/block headers and the content checksum follow RFC 8878.
-    Verified against 7za 25.01 and fzip's own extractor.
+    Huffman-coded (4-stream, FSE- or direct-encoded weight tables, and a
+    reused table across blocks via **treeless literals**) when beneficial,
+    otherwise RLE/raw. Sequences are FSE-coded with **per-block tables**
+    (RLE for single-symbol streams, predefined for tiny blocks, and an
+    accuracy-log search for small blocks). It emits **repeat-offset codes**
+    (rep 1-3), uses a **shared window up to 8 MiB** so matches can reference
+    previous blocks at higher levels, and uses a **multi-pass optimal
+    (shortest-path) parser** at the top levels. Frame/block headers and the
+    content checksum follow RFC 8878. Verified against 7za 25.01 and fzip's
+    own extractor.
   - Ratio now beats 7za's deflate while decoding much faster.
 - **Per-file codec selection**: for compressible inputs `auto` trial-compresses
   the candidates (deflate-9 and zstd at the requested level) and keeps the

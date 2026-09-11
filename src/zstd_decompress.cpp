@@ -164,9 +164,12 @@ auto read_num_sequences(const std::byte* p, const std::byte* end,
            (static_cast<std::uint8_t>(p[1]) << 8) + 0x7F00;
 }
 
-// Decode the literals section (raw, RLE, or Huffman-compressed).
+// Decode the literals section (raw, RLE, Huffman-compressed, or treeless).
+// `prev_huf` carries the Huffman table across compressed blocks within a
+// frame: a Compressed block replaces it, a Treeless block reuses it.
 auto decode_literals(const std::byte* data, std::size_t size,
-                     std::size_t& consumed) -> std::vector<std::byte> {
+                     std::size_t& consumed, HufTable* prev_huf)
+    -> std::vector<std::byte> {
     if (size < 1) throw ZstdError("literals block: too short");
     const std::byte* p = data;
     const std::byte* end = data + size;
@@ -205,7 +208,7 @@ auto decode_literals(const std::byte* data, std::size_t size,
         return std::vector<std::byte>(static_cast<std::size_t>(regen), *p);
     }
 
-    if (type == 2) {
+    if (type == 2 || type == 3) {
         const int k = (size_format == 0 || size_format == 1)
                           ? 10
                           : (size_format == 2 ? 14 : 18);
@@ -221,16 +224,30 @@ auto decode_literals(const std::byte* data, std::size_t size,
         const std::byte* body = p + hdr_size;
         if (body + csize > end) throw ZstdError("compressed literals: truncated");
 
-        HufTable t;
-        std::size_t weight_consumed = 0;
-        if (!huf_read_weights(body, static_cast<std::size_t>(csize), t,
-                              weight_consumed)) {
-            throw ZstdError("unsupported Huffman weight encoding");
+        HufTable local;
+        const HufTable* tbl = nullptr;
+        const std::byte* streams = body;
+        std::size_t streams_size = static_cast<std::size_t>(csize);
+        if (type == 2) {
+            std::size_t weight_consumed = 0;
+            if (!huf_read_weights(body, static_cast<std::size_t>(csize), local,
+                                  weight_consumed)) {
+                throw ZstdError("unsupported Huffman weight encoding");
+            }
+            streams = body + weight_consumed;
+            streams_size = static_cast<std::size_t>(csize) - weight_consumed;
+            tbl = &local;
+            if (prev_huf != nullptr) *prev_huf = local;
+        } else {
+            if (prev_huf == nullptr || prev_huf->table_log == 0) {
+                throw ZstdError(
+                    "treeless literals block without a previous Huffman "
+                    "table");
+            }
+            tbl = prev_huf;
         }
-        const std::byte* streams = body + weight_consumed;
-        const std::size_t streams_size =
-            static_cast<std::size_t>(csize) - weight_consumed;
-        auto lits = huf_decode_streams(t, streams, streams_size, regen,
+
+        auto lits = huf_decode_streams(*tbl, streams, streams_size, regen,
                                        size_format);
         consumed = static_cast<std::size_t>(p - data) +
                    static_cast<std::size_t>(hdr_size) +
@@ -238,7 +255,7 @@ auto decode_literals(const std::byte* data, std::size_t size,
         return lits;
     }
 
-    throw ZstdError("treeless literals block not supported");
+    throw ZstdError("reserved literals block type");
 }
 
 // Map a sequence code to its (base, extra-bits) for a given stream kind:
@@ -331,7 +348,7 @@ void build_seq_table(int mode, int kind, const std::byte*& p,
 // across compressed blocks).
 void decompress_compressed_block(const std::byte* data, std::size_t size,
                                  std::vector<std::byte>& out,
-                                 RepeatOffsets& repeat) {
+                                 RepeatOffsets& repeat, HufTable& prev_huf) {
     // Compressed block format:
     //   1. Literals section (variable size)
     //   2. Sequences section
@@ -339,7 +356,7 @@ void decompress_compressed_block(const std::byte* data, std::size_t size,
     std::size_t consumed = 0;
 
     // Decode literals.
-    auto literals = decode_literals(data, size, consumed);
+    auto literals = decode_literals(data, size, consumed, &prev_huf);
     const std::byte* p = data + consumed;
     const std::byte* end = data + size;
 
@@ -382,7 +399,7 @@ void decompress_compressed_block(const std::byte* data, std::size_t size,
 // Decompress one block (handles all block types), appending to `out`.
 void decompress_block(const std::byte* data, std::size_t size,
                       const BlockHeader& hdr, std::vector<std::byte>& out,
-                      RepeatOffsets& repeat) {
+                      RepeatOffsets& repeat, HufTable& prev_huf) {
     switch (hdr.type) {
         case BlockType::Raw:
             if (size < hdr.block_size) throw ZstdError("raw block truncated");
@@ -393,7 +410,7 @@ void decompress_block(const std::byte* data, std::size_t size,
             out.insert(out.end(), hdr.block_size, data[0]);
             break;
         case BlockType::Compressed:
-            decompress_compressed_block(data, size, out, repeat);
+            decompress_compressed_block(data, size, out, repeat, prev_huf);
             break;
         default:
             throw ZstdError("reserved block type");
@@ -438,6 +455,7 @@ auto decompress(std::span<const std::byte> data, std::size_t) -> std::vector<std
         output.reserve(static_cast<std::size_t>(hdr.frame_content_size));
     }
     RepeatOffsets repeat;
+    HufTable prev_huf;  // reused by Treeless_Literals_Blocks
     bool last = false;
     while (!last && p < end) {
         BlockHeader blk;
@@ -455,7 +473,8 @@ auto decompress(std::span<const std::byte> data, std::size_t) -> std::vector<std
         const std::size_t content_len =
             (blk.type == BlockType::RLE) ? 1 : blk.block_size;
         const std::size_t avail = static_cast<std::size_t>(end - p);
-        decompress_block(p, std::min(content_len, avail), blk, output, repeat);
+        decompress_block(p, std::min(content_len, avail), blk, output, repeat,
+                         prev_huf);
         p += content_len;
     }
 

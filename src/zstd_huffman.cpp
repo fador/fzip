@@ -376,30 +376,33 @@ auto huf_build(const std::vector<std::uint32_t>& freqs, int max_bits)
     return t;
 }
 
-auto huf_compress_literals(const std::uint8_t* literals, int num_literals,
-                           std::vector<std::byte>& out) -> bool {
+auto huf_literals_table(const std::uint8_t* literals, int num_literals,
+                        HufTable& t) -> bool {
     if (num_literals < 2) return false;
     std::vector<std::uint32_t> freqs(256, 0);
     for (int i = 0; i < num_literals; ++i) freqs[literals[i]]++;
-    HufTable t = huf_build(freqs, 11);
+    t = huf_build(freqs, 11);
+    return t.table_log != 0;
+}
+
+auto huf_encode_streams(const HufTable& t, const std::uint8_t* literals,
+                        int num_literals, std::vector<std::byte>& out) -> bool {
     if (t.table_log == 0) return false;
-
-    std::vector<std::byte> weights;
-    if (!write_weights(t, weights)) return false;
-
     int sizes[4];
     stream_sizes(num_literals, sizes);
     std::vector<std::byte> streams[4];
     int offset = 0;
     for (int i = 0; i < 4; ++i) {
         if (sizes[i] > 0) {
+            for (int j = 0; j < sizes[i]; ++j) {
+                if (t.lengths[literals[offset + j]] == 0) return false;
+            }
             encode_stream(t, literals + offset, sizes[i], streams[i]);
         }
         offset += sizes[i];
     }
 
     out.clear();
-    out.insert(out.end(), weights.begin(), weights.end());
     // Jump table: sizes of streams 1-3 as 2-byte little-endian.
     for (int i = 0; i < 3; ++i) {
         std::uint32_t s = static_cast<std::uint32_t>(streams[i].size());
@@ -410,6 +413,26 @@ auto huf_compress_literals(const std::uint8_t* literals, int num_literals,
         out.insert(out.end(), streams[i].begin(), streams[i].end());
     }
     return true;
+}
+
+auto huf_encode_with_table(const HufTable& t, const std::uint8_t* literals,
+                           int num_literals, std::vector<std::byte>& out)
+    -> bool {
+    std::vector<std::byte> weights;
+    if (!write_weights(t, weights)) return false;
+    std::vector<std::byte> body;
+    if (!huf_encode_streams(t, literals, num_literals, body)) return false;
+    out.clear();
+    out.insert(out.end(), weights.begin(), weights.end());
+    out.insert(out.end(), body.begin(), body.end());
+    return true;
+}
+
+auto huf_compress_literals(const std::uint8_t* literals, int num_literals,
+                           std::vector<std::byte>& out) -> bool {
+    HufTable t;
+    if (!huf_literals_table(literals, num_literals, t)) return false;
+    return huf_encode_with_table(t, literals, num_literals, out);
 }
 
 auto huf_read_weights(const std::byte* data, std::size_t size, HufTable& t,

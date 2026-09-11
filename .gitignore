@@ -24,6 +24,7 @@ corpus/enwik9/
 *.7z
 test_tmp/
 verify_tmp/
+bench/real/
 
 # Python
 __pycache__/
