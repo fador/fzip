@@ -99,6 +99,8 @@ def generate_mixed(size: int) -> bytes:
 def make_corpus(workdir: Path) -> list[tuple[str, int]]:
     """Create test corpus files. Returns list of (filename, size)."""
     corpus_dir = workdir / "corpus"
+    if corpus_dir.exists():
+        shutil.rmtree(corpus_dir)
     corpus_dir.mkdir(parents=True, exist_ok=True)
     return _make_synthetic_corpus(corpus_dir)
 

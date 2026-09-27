@@ -330,8 +330,9 @@ auto find_match(const std::uint8_t* data, std::size_t size, std::size_t pos,
     while (cand >= 0 && tries-- > 0) {
         if (cand < limit) break;
         // Quick check: does the candidate extend the best match prefix?
-        if (best.len > kMinMatch &&
-            data[cand + best.len - 1] != data[pos + best.len - 1]) {
+        if (best.len >= kMinMatch &&
+            (data[cand + best.len] != data[pos + best.len] ||
+             data[cand + best.len - 1] != data[pos + best.len - 1])) {
             cand = prev[static_cast<std::size_t>(cand) & (kWindow - 1)];
             continue;
         }
@@ -537,7 +538,7 @@ struct MatchCand {
 
 // Maximum Pareto candidates kept per position: closer matches (cheaper
 // distance codes) versus longer matches.
-constexpr int kMaxCands = 6;
+constexpr int kMaxCands = 16;
 
 // Collect Pareto-optimal matches at `pos` into `out` (capacity kMaxCands):
 // matches for which no other match is both at least as long and at least as
@@ -562,6 +563,16 @@ auto find_match_candidates(const std::uint8_t* data, std::size_t size,
     auto consider = [&](int cand) -> bool {
         if (cand < limit) return false;
         const int d = static_cast<int>(pos) - cand;
+
+        // Quick rejection: if distance is larger than all existing candidates,
+        // this candidate must beat best_len to be non-dominated.
+        if (n > 0 && d >= out[n - 1].dist && best_len >= kMinMatch) {
+            if (best_len >= maxl) return false;
+            if (data[cand + best_len] != data[pos + best_len]) {
+                return true;  // Can't beat best_len, but older candidates might
+            }
+        }
+
         int l = 0;
         while (l < maxl && data[cand + l] == data[pos + l]) ++l;
         if (l >= kMinMatch) {
@@ -587,9 +598,11 @@ auto find_match_candidates(const std::uint8_t* data, std::size_t size,
                     for (int j = n; j > ins; --j) out[j] = out[j - 1];
                     out[ins] = MatchCand{l, d};
                     ++n;
+                } else if (l > out[n - 1].len) {
+                    out[n - 1] = MatchCand{l, d};
                 }
             }
-            if (l >= maxl || n >= kMaxCands) return false;
+            if (l >= maxl) return false;
         }
         return true;
     };

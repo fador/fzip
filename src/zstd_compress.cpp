@@ -23,11 +23,13 @@ namespace fzip::zstd {
 
 namespace {
 
-// --- LZ77 match finder: 3-byte hash + hash chains over a configurable
-// window. Chains persist across blocks so matches can reach into earlier
-// blocks (bounded by `window`). ---
+// --- LZ77 match finder: dual hash (3-byte and 4-byte) + hash chains over a
+// configurable window. Chains persist across blocks so matches can reach
+// into earlier blocks (bounded by `window`). ---
 constexpr int kHashBits = 16;
 constexpr int kHashSize = 1 << kHashBits;
+constexpr int kHashBits4 = 17;
+constexpr int kHashSize4 = 1 << kHashBits4;
 constexpr int kMinMatch = 3;
 constexpr int kMaxMatch = 131074;  // zstd max match length
 
@@ -46,13 +48,23 @@ inline auto hash3(const std::uint8_t* p) -> std::uint32_t {
     return (h * 2654435761u) >> (32 - kHashBits);
 }
 
+inline auto hash4(const std::uint8_t* p) -> std::uint32_t {
+    std::uint32_t v = static_cast<std::uint32_t>(p[0]) |
+                      (static_cast<std::uint32_t>(p[1]) << 8) |
+                      (static_cast<std::uint32_t>(p[2]) << 16) |
+                      (static_cast<std::uint32_t>(p[3]) << 24);
+    return (v * 2654435761u) >> (32 - kHashBits4);
+}
+
 struct MatchFinder {
     const std::uint8_t* data = nullptr;
     std::size_t size = 0;
     int window = kBlockSize;  // power of two
     int mask = kBlockSize - 1;
-    std::vector<int> head;  // kHashSize
-    std::vector<int> prev;  // window
+    std::vector<int> head;   // kHashSize (3-byte)
+    std::vector<int> prev;   // window
+    std::vector<int> head4;  // kHashSize4 (4-byte)
+    std::vector<int> prev4;  // window
 
     void reset(const std::uint8_t* d, std::size_t n, int w) {
         data = d;
@@ -61,15 +73,25 @@ struct MatchFinder {
         mask = w - 1;
         head.assign(kHashSize, -1);
         prev.assign(static_cast<std::size_t>(w), -1);
+        head4.assign(kHashSize4, -1);
+        prev4.assign(static_cast<std::size_t>(w), -1);
     }
 
     void insert(std::size_t pos) {
         if (pos + kMinMatch > size) return;
-        std::uint32_t h = hash3(data + pos);
         int p = static_cast<int>(pos);
-        prev[static_cast<std::size_t>(p) & static_cast<std::size_t>(mask)] =
-            head[h];
-        head[h] = p;
+        const std::size_t wpos =
+            static_cast<std::size_t>(p) & static_cast<std::size_t>(mask);
+
+        std::uint32_t h3 = hash3(data + pos);
+        prev[wpos] = head[h3];
+        head[h3] = p;
+
+        if (pos + 4 <= size) {
+            std::uint32_t h4 = hash4(data + pos);
+            prev4[wpos] = head4[h4];
+            head4[h4] = p;
+        }
     }
 
     // Find the longest match at `pos` that ends no later than `end`.
@@ -78,33 +100,66 @@ struct MatchFinder {
         if (pos + kMinMatch > end) return best;
         const int maxl = static_cast<int>(std::min<std::size_t>(
             static_cast<std::size_t>(kMaxMatch), end - pos));
-        // Stop walking the chain once the match is "good enough": further
-        // search rarely beats it and repetitive data would otherwise make
-        // each comparison run to the end of the block for every candidate.
         int nice_len = effort < 64 ? 64 : (effort > 258 ? 258 : effort);
         if (nice_len > maxl) nice_len = maxl;
-        std::uint32_t h = hash3(data + pos);
-        int cand = head[h];
         int limit = static_cast<int>(pos) - window;
         if (limit < 0) limit = 0;
-        int tries = effort;
-        while (cand >= 0 && tries-- > 0) {
-            if (cand < limit) break;
-            if (best.length > kMinMatch &&
-                data[cand + best.length - 1] != data[pos + best.length - 1]) {
+
+        // 1. Search 4-byte chain first for long matches
+        if (pos + 4 <= end) {
+            std::uint32_t h4 = hash4(data + pos);
+            int cand = head4[h4];
+            int tries = effort;
+            while (cand >= 0 && tries-- > 0) {
+                if (cand < limit) break;
+                if (best.length >= 4) {
+                    if (best.length >= maxl) break;
+                    if (data[cand + best.length] != data[pos + best.length] ||
+                        data[cand + best.length - 1] !=
+                            data[pos + best.length - 1]) {
+                        cand = prev4[static_cast<std::size_t>(cand) &
+                                     static_cast<std::size_t>(mask)];
+                        continue;
+                    }
+                }
+                int l = 0;
+                while (l < maxl && data[cand + l] == data[pos + l]) ++l;
+                if (l >= 4 && l > best.length) {
+                    best.length = l;
+                    best.distance = static_cast<int>(pos) - cand;
+                    if (l >= maxl || l >= nice_len) break;
+                }
+                cand = prev4[static_cast<std::size_t>(cand) &
+                             static_cast<std::size_t>(mask)];
+            }
+        }
+
+        // 2. Search 3-byte chain for short matches if no 4+ byte match found
+        if (best.length < 4) {
+            std::uint32_t h3 = hash3(data + pos);
+            int cand = head[h3];
+            int tries = effort;
+            while (cand >= 0 && tries-- > 0) {
+                if (cand < limit) break;
+                if (best.length >= kMinMatch) {
+                    if (data[cand + best.length] != data[pos + best.length] ||
+                        data[cand + best.length - 1] !=
+                            data[pos + best.length - 1]) {
+                        cand = prev[static_cast<std::size_t>(cand) &
+                                    static_cast<std::size_t>(mask)];
+                        continue;
+                    }
+                }
+                int l = 0;
+                while (l < maxl && data[cand + l] == data[pos + l]) ++l;
+                if (l >= kMinMatch && l > best.length) {
+                    best.length = l;
+                    best.distance = static_cast<int>(pos) - cand;
+                    if (l >= maxl || l >= nice_len) break;
+                }
                 cand = prev[static_cast<std::size_t>(cand) &
                             static_cast<std::size_t>(mask)];
-                continue;
             }
-            int l = 0;
-            while (l < maxl && data[cand + l] == data[pos + l]) ++l;
-            if (l >= kMinMatch && l > best.length) {
-                best.length = l;
-                best.distance = static_cast<int>(pos) - cand;
-                if (l >= maxl || l >= nice_len) break;
-            }
-            cand = prev[static_cast<std::size_t>(cand) &
-                        static_cast<std::size_t>(mask)];
         }
         return best;
     }
@@ -118,72 +173,6 @@ struct Seq {
     int match_dist = 0;
 };
 
-// LZ77 + lazy matching over `[start, end)`. Positions are absolute within
-// `mf.data`; the shared finder may reference earlier blocks.
-auto build_sequences(MatchFinder& mf, std::size_t start, std::size_t end,
-                     int effort, bool lazy,
-                     std::vector<std::uint8_t>& literals) -> std::vector<Seq> {
-    std::vector<Seq> seqs;
-    literals.clear();
-
-    auto flush_literals = [&](std::size_t from, std::size_t to) {
-        for (std::size_t i = from; i < to; ++i) {
-            literals.push_back(mf.data[i]);
-        }
-    };
-
-    std::size_t pos = start;
-    std::size_t lit_start = start;
-    while (pos < end) {
-        Match m = mf.find(pos, end, effort);
-        if (m.length < kMinMatch) {
-            mf.insert(pos);
-            ++pos;
-            continue;
-        }
-
-        // Lazy matching: insert pos, then look one byte ahead. If the next
-        // position yields a longer match, emit a literal here and take it.
-        if (lazy && pos + 1 < end) {
-            mf.insert(pos);
-            Match m2 = mf.find(pos + 1, end, effort);
-            if (m2.length > m.length) {
-                ++pos;
-                m = m2;
-                flush_literals(lit_start, pos);
-                Seq s;
-                s.lit_len = static_cast<int>(pos - lit_start);
-                s.match_len = m.length;
-                s.match_dist = m.distance;
-                seqs.push_back(s);
-                for (int i = 0; i < m.length; ++i) {
-                    mf.insert(pos + static_cast<std::size_t>(i));
-                }
-                pos += static_cast<std::size_t>(m.length);
-                lit_start = pos;
-                continue;
-            }
-        } else {
-            mf.insert(pos);
-        }
-
-        // Take the match at pos (pos already inserted).
-        flush_literals(lit_start, pos);
-        Seq s;
-        s.lit_len = static_cast<int>(pos - lit_start);
-        s.match_len = m.length;
-        s.match_dist = m.distance;
-        seqs.push_back(s);
-        for (int i = 1; i < m.length; ++i) {
-            mf.insert(pos + static_cast<std::size_t>(i));
-        }
-        pos += static_cast<std::size_t>(m.length);
-        lit_start = pos;
-    }
-    flush_literals(lit_start, end);
-    return seqs;
-}
-
 struct Code {
     int code = 0;
     int extra_bits = 0;
@@ -191,183 +180,14 @@ struct Code {
 };
 
 // Shannon cost in bits for a symbol with the given frequency.
-struct Code;
-auto lit_len_code(int len) -> Code;
-auto match_len_code(int len) -> Code;
-auto offset_code(int dist) -> Code;
-
 inline auto sym_cost(int freq, int total) -> float {
     if (freq <= 0 || total <= 0) return 12.0f;
     return -std::log2(static_cast<float>(freq) / static_cast<float>(total));
 }
 
-// Optimal (shortest-path) LZ77 parse over `[start, end)`. A single forward
-// pass records the longest match at every position (extending the shared
-// finder). Symbol costs are refined over a few DP iterations: a greedy parse
-// seeds the statistics, then each pass updates them from the new parse.
-auto build_sequences_optimal(MatchFinder& mf, std::size_t start,
-                             std::size_t end, int effort, int passes,
-                             std::vector<std::uint8_t>& literals)
-    -> std::vector<Seq> {
-    const int N = static_cast<int>(end - start);
-    if (N <= 0) {
-        literals.clear();
-        return {};
-    }
-
-    // Forward pass: longest match at every position.
-    std::vector<int> best_len(static_cast<std::size_t>(N), 0);
-    std::vector<int> best_dist(static_cast<std::size_t>(N), 0);
-    for (int p = 0; p < N; ++p) {
-        const std::size_t pos = start + static_cast<std::size_t>(p);
-        Match m = mf.find(pos, end, effort);
-        best_len[static_cast<std::size_t>(p)] = m.length;
-        best_dist[static_cast<std::size_t>(p)] = m.distance;
-        mf.insert(pos);
-    }
-
-    // Max match length representable by each match-length code.
-    int ml_range_max[53];
-    for (int c = 0; c < 53; ++c) {
-        ml_range_max[c] = matchlen_code_to_base(c) +
-                          (1 << matchlen_code_to_extra(c)) - 1;
-    }
-    const int c_min = match_len_code(kMinMatch).code;
-
-    // Symbol statistics, seeded by a greedy parse over the recorded matches.
-    int lit_freq[256] = {0};
-    int ll_freq[36] = {0};
-    int of_freq[32] = {0};
-    int ml_freq[53] = {0};
-    int n_lit = 0;
-    int n_seq = 0;
-    {
-        int p = 0;
-        int lit_run = 0;
-        while (p < N) {
-            const int L = best_len[static_cast<std::size_t>(p)];
-            if (L >= kMinMatch) {
-                ll_freq[lit_len_code(lit_run).code]++;
-                of_freq[offset_code(
-                            best_dist[static_cast<std::size_t>(p)]).code]++;
-                ml_freq[match_len_code(L).code]++;
-                ++n_seq;
-                p += L;
-                lit_run = 0;
-            } else {
-                lit_freq[mf.data[start + static_cast<std::size_t>(p)]]++;
-                ++n_lit;
-                ++p;
-                ++lit_run;
-            }
-        }
-    }
-
-    std::vector<float> cost(static_cast<std::size_t>(N) + 1, 0.0f);
-    std::vector<int> choice_len(static_cast<std::size_t>(N), 1);
-    std::vector<int> choice_dist(static_cast<std::size_t>(N), 0);
-    std::vector<Seq> seqs;
-    literals.clear();
-
-    if (passes < 1) passes = 1;
-    for (int pass = 0; pass < passes; ++pass) {
-        float lit_cost[256];
-        for (int s = 0; s < 256; ++s) {
-            float c = sym_cost(lit_freq[s], n_lit);
-            if (c > 12.0f) c = 12.0f;
-            if (c < 1.0f) c = 1.0f;
-            lit_cost[s] = c;
-        }
-        float mlc_cost[53];
-        for (int c = 0; c < 53; ++c) {
-            mlc_cost[c] = sym_cost(ml_freq[c], n_seq) +
-                          static_cast<float>(matchlen_code_to_extra(c));
-        }
-        float ofc_cost[32];
-        for (int c = 0; c < 32; ++c) {
-            ofc_cost[c] = sym_cost(of_freq[c], n_seq) + static_cast<float>(c);
-        }
-
-        // Backward DP.
-        cost[static_cast<std::size_t>(N)] = 0.0f;
-        for (int i = N - 1; i >= 0; --i) {
-            float best =
-                lit_cost[mf.data[start + static_cast<std::size_t>(i)]] +
-                cost[static_cast<std::size_t>(i) + 1];
-            int bl = 1;
-            int bd = 0;
-            const int ml = best_len[static_cast<std::size_t>(i)];
-            if (ml >= kMinMatch) {
-                const int d = best_dist[static_cast<std::size_t>(i)];
-                const float dc = ofc_cost[offset_code(d).code];
-                const int c_max = match_len_code(ml).code;
-                for (int c = c_min; c <= c_max; ++c) {
-                    int L = ml_range_max[c];
-                    if (L > ml) L = ml;
-                    if (L < kMinMatch) continue;
-                    float mc = mlc_cost[c] + dc +
-                               cost[static_cast<std::size_t>(i + L)];
-                    if (mc < best) {
-                        best = mc;
-                        bl = L;
-                        bd = d;
-                    }
-                }
-            }
-            cost[static_cast<std::size_t>(i)] = best;
-            choice_len[static_cast<std::size_t>(i)] = bl;
-            choice_dist[static_cast<std::size_t>(i)] = bd;
-        }
-
-        // Reconstruct the token stream.
-        seqs.clear();
-        literals.clear();
-        int pos = 0;
-        int lit_start = 0;
-        while (pos < N) {
-            const int L = choice_len[static_cast<std::size_t>(pos)];
-            if (L <= 1) {
-                ++pos;
-                continue;
-            }
-            for (int i = lit_start; i < pos; ++i) {
-                literals.push_back(
-                    mf.data[start + static_cast<std::size_t>(i)]);
-            }
-            Seq s;
-            s.lit_len = pos - lit_start;
-            s.match_len = L;
-            s.match_dist = choice_dist[static_cast<std::size_t>(pos)];
-            seqs.push_back(s);
-            pos += L;
-            lit_start = pos;
-        }
-        for (int i = lit_start; i < N; ++i) {
-            literals.push_back(mf.data[start + static_cast<std::size_t>(i)]);
-        }
-
-        // Recompute statistics from this parse for the next iteration.
-        if (pass + 1 < passes) {
-            std::fill_n(lit_freq, 256, 0);
-            std::fill_n(ll_freq, 36, 0);
-            std::fill_n(of_freq, 32, 0);
-            std::fill_n(ml_freq, 53, 0);
-            for (std::uint8_t b : literals) lit_freq[b]++;
-            n_lit = static_cast<int>(literals.size());
-            for (const Seq& s : seqs) {
-                ll_freq[lit_len_code(s.lit_len).code]++;
-                of_freq[offset_code(s.match_dist).code]++;
-                ml_freq[match_len_code(s.match_len).code]++;
-            }
-            n_seq = static_cast<int>(seqs.size());
-        }
-    }
-    return seqs;
-}
-
 // --- Code tables (RFC 8878 §4.2.2) ---
 
-Code lit_len_code(int len) {
+inline Code lit_len_code(int len) {
     static const int kBase[36] = {
         0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
         16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048,
@@ -381,7 +201,7 @@ Code lit_len_code(int len) {
     return {0, 0, 0};
 }
 
-Code match_len_code(int len) {
+inline Code match_len_code(int len) {
     static const int kBase[53] = {
         3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18,
         19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
@@ -399,18 +219,18 @@ Code match_len_code(int len) {
 
 // Offset code: Offset_Value = (1 << code) + extra, offset = Offset_Value - 3.
 // Codes 0..1 are repeat codes; explicit offsets use code >= 2.
-Code offset_code(int dist) {
+inline Code offset_code(int dist) {
     int v = dist + 3;
     int code = 0;
     while ((1 << (code + 1)) <= v) ++code;
-    if (code < 2) code = 2;  // never use repeat codes
+    if (code < 2) code = 2;  // never use repeat codes for explicit offsets
     return {code, code, v - (1 << code)};
 }
 
 // Pick the cheapest offset code for `dist` given the current repeat state,
 // updating `rep` to exactly the state the decoder will have afterwards.
 // Mirrors ZSTD_decodeSequence's repeat-offset logic (RFC 8878 §3.1.1.5).
-Code choose_offset(int dist, int lit_len, RepeatOffsets& rep) {
+inline Code choose_offset(int dist, int lit_len, RepeatOffsets& rep) {
     const bool ll0 = (lit_len == 0);
     if (!ll0) {
         if (dist == rep.offsets[0]) {
@@ -457,6 +277,352 @@ Code choose_offset(int dist, int lit_len, RepeatOffsets& rep) {
     rep.offsets[1] = rep.offsets[0];
     rep.offsets[0] = dist;
     return c;
+}
+
+struct RepMatch {
+    int dist = 0;
+    int len = 0;
+    int rep_idx = -1;  // 0, 1, or 2
+};
+
+inline auto find_rep_match(const std::uint8_t* data, std::size_t pos,
+                           std::size_t end, const RepeatOffsets& rep,
+                           int min_len = 3) -> RepMatch {
+    RepMatch best;
+    for (int idx = 0; idx < 3; ++idx) {
+        int d = rep.offsets[idx];
+        if (d <= 0 || static_cast<int>(pos) < d) continue;
+        const std::size_t cand = pos - static_cast<std::size_t>(d);
+        if (data[cand] != data[pos]) continue;
+        int l = 0;
+        const int maxl = static_cast<int>(std::min<std::size_t>(
+            static_cast<std::size_t>(kMaxMatch), end - pos));
+        while (l < maxl && data[cand + l] == data[pos + l]) ++l;
+        if (l >= min_len && l > best.len) {
+            best.dist = d;
+            best.len = l;
+            best.rep_idx = idx;
+        }
+    }
+    return best;
+}
+
+// LZ77 + lazy matching over `[start, end)`. Positions are absolute within
+// `mf.data`; the shared finder may reference earlier blocks. Tracks and
+// exploits repeat offsets.
+auto build_sequences(MatchFinder& mf, std::size_t start, std::size_t end,
+                     int effort, bool lazy,
+                     std::vector<std::uint8_t>& literals,
+                     RepeatOffsets& rep) -> std::vector<Seq> {
+    std::vector<Seq> seqs;
+    literals.clear();
+
+    auto flush_literals = [&](std::size_t from, std::size_t to) {
+        for (std::size_t i = from; i < to; ++i) {
+            literals.push_back(mf.data[i]);
+        }
+    };
+
+    std::size_t pos = start;
+    std::size_t lit_start = start;
+    while (pos < end) {
+        RepMatch rep_m = find_rep_match(mf.data, pos, end, rep);
+        Match m = mf.find(pos, end, effort);
+
+        bool use_rep = (rep_m.len >= kMinMatch);
+        if (use_rep && m.length > rep_m.len) {
+            int extra_cost_bytes = (m.distance > 256) ? 2 : 1;
+            if (m.length <= rep_m.len + extra_cost_bytes) {
+                use_rep = true;
+            } else {
+                use_rep = false;
+            }
+        }
+        if (use_rep) {
+            m.length = rep_m.len;
+            m.distance = rep_m.dist;
+        }
+
+        if (m.length < kMinMatch) {
+            mf.insert(pos);
+            ++pos;
+            continue;
+        }
+
+        // Lazy matching: insert pos, then look one byte ahead.
+        if (lazy && pos + 1 < end) {
+            mf.insert(pos);
+            RepMatch rep_m2 = find_rep_match(mf.data, pos + 1, end, rep);
+            Match m2 = mf.find(pos + 1, end, effort);
+            bool use_rep2 = (rep_m2.len >= kMinMatch);
+            if (use_rep2 && m2.length > rep_m2.len) {
+                int extra_cost_bytes = (m2.distance > 256) ? 2 : 1;
+                if (m2.length <= rep_m2.len + extra_cost_bytes) {
+                    use_rep2 = true;
+                } else {
+                    use_rep2 = false;
+                }
+            }
+            if (use_rep2) {
+                m2.length = rep_m2.len;
+                m2.distance = rep_m2.dist;
+            }
+
+            if (m2.length > m.length) {
+                ++pos;
+                m = m2;
+                flush_literals(lit_start, pos);
+                Seq s;
+                s.lit_len = static_cast<int>(pos - lit_start);
+                s.match_len = m.length;
+                s.match_dist = m.distance;
+                choose_offset(s.match_dist, s.lit_len, rep);
+                seqs.push_back(s);
+                for (int i = 0; i < m.length; ++i) {
+                    mf.insert(pos + static_cast<std::size_t>(i));
+                }
+                pos += static_cast<std::size_t>(m.length);
+                lit_start = pos;
+                continue;
+            }
+        } else {
+            mf.insert(pos);
+        }
+
+        // Take the match at pos (pos already inserted).
+        flush_literals(lit_start, pos);
+        Seq s;
+        s.lit_len = static_cast<int>(pos - lit_start);
+        s.match_len = m.length;
+        s.match_dist = m.distance;
+        choose_offset(s.match_dist, s.lit_len, rep);
+        seqs.push_back(s);
+        for (int i = 1; i < m.length; ++i) {
+            mf.insert(pos + static_cast<std::size_t>(i));
+        }
+        pos += static_cast<std::size_t>(m.length);
+        lit_start = pos;
+    }
+    flush_literals(lit_start, end);
+    return seqs;
+}
+
+// Optimal (shortest-path) LZ77 parse over `[start, end)`. A single forward
+// pass records the longest match and repeat matches at every position.
+// Symbol costs are refined over a few DP iterations, accurately modeling
+// repeat offset costs.
+auto build_sequences_optimal(MatchFinder& mf, std::size_t start,
+                             std::size_t end, int effort, int passes,
+                             std::vector<std::uint8_t>& literals,
+                             RepeatOffsets& rep)
+    -> std::vector<Seq> {
+    const int N = static_cast<int>(end - start);
+    if (N <= 0) {
+        literals.clear();
+        return {};
+    }
+
+    const RepeatOffsets initial_rep = rep;
+
+    // Forward pass: longest match AND repeat match at every position.
+    std::vector<int> best_len(static_cast<std::size_t>(N), 0);
+    std::vector<int> best_dist(static_cast<std::size_t>(N), 0);
+    std::vector<int> rep_len(static_cast<std::size_t>(N), 0);
+    std::vector<int> rep_dist(static_cast<std::size_t>(N), 0);
+    for (int p = 0; p < N; ++p) {
+        const std::size_t pos = start + static_cast<std::size_t>(p);
+        Match m = mf.find(pos, end, effort);
+        best_len[static_cast<std::size_t>(p)] = m.length;
+        best_dist[static_cast<std::size_t>(p)] = m.distance;
+
+        RepMatch rm = find_rep_match(mf.data, pos, end, initial_rep);
+        if (rm.len >= kMinMatch) {
+            rep_len[static_cast<std::size_t>(p)] = rm.len;
+            rep_dist[static_cast<std::size_t>(p)] = rm.dist;
+        }
+
+        mf.insert(pos);
+    }
+
+    // Max match length representable by each match-length code.
+    int ml_range_max[53];
+    for (int c = 0; c < 53; ++c) {
+        ml_range_max[c] = matchlen_code_to_base(c) +
+                          (1 << matchlen_code_to_extra(c)) - 1;
+    }
+    const int c_min = match_len_code(kMinMatch).code;
+
+    // Symbol statistics, seeded by a greedy parse over the recorded matches.
+    int lit_freq[256] = {0};
+    int ll_freq[36] = {0};
+    int of_freq[32] = {0};
+    int ml_freq[53] = {0};
+    int n_lit = 0;
+    int n_seq = 0;
+    {
+        int p = 0;
+        int lit_run = 0;
+        RepeatOffsets greedy_rep = initial_rep;
+        while (p < N) {
+            int L = best_len[static_cast<std::size_t>(p)];
+            int d = best_dist[static_cast<std::size_t>(p)];
+            int rl = rep_len[static_cast<std::size_t>(p)];
+            int rd = rep_dist[static_cast<std::size_t>(p)];
+            if (rl >= kMinMatch && rl + 2 >= L) {
+                L = rl;
+                d = rd;
+            }
+            if (L >= kMinMatch) {
+                ll_freq[lit_len_code(lit_run).code]++;
+                Code oc = choose_offset(d, lit_run, greedy_rep);
+                of_freq[oc.code]++;
+                ml_freq[match_len_code(L).code]++;
+                ++n_seq;
+                p += L;
+                lit_run = 0;
+            } else {
+                lit_freq[mf.data[start + static_cast<std::size_t>(p)]]++;
+                ++n_lit;
+                ++p;
+                ++lit_run;
+            }
+        }
+    }
+
+    std::vector<float> cost(static_cast<std::size_t>(N) + 1, 0.0f);
+    std::vector<int> choice_len(static_cast<std::size_t>(N), 1);
+    std::vector<int> choice_dist(static_cast<std::size_t>(N), 0);
+    std::vector<Seq> seqs;
+    literals.clear();
+
+    if (passes < 1) passes = 1;
+    for (int pass = 0; pass < passes; ++pass) {
+        float lit_cost[256];
+        for (int s = 0; s < 256; ++s) {
+            float c = sym_cost(lit_freq[s], n_lit);
+            if (c > 12.0f) c = 12.0f;
+            if (c < 1.0f) c = 1.0f;
+            lit_cost[s] = c;
+        }
+        float mlc_cost[53];
+        for (int c = 0; c < 53; ++c) {
+            mlc_cost[c] = sym_cost(ml_freq[c], n_seq) +
+                          static_cast<float>(matchlen_code_to_extra(c));
+        }
+        float ofc_cost[32];
+        for (int c = 0; c < 32; ++c) {
+            int extra = (c == 0) ? 0 : (c == 1 ? 1 : c);
+            ofc_cost[c] = sym_cost(of_freq[c], n_seq) + static_cast<float>(extra);
+        }
+
+        // Backward DP.
+        cost[static_cast<std::size_t>(N)] = 0.0f;
+        for (int i = N - 1; i >= 0; --i) {
+            float best =
+                lit_cost[mf.data[start + static_cast<std::size_t>(i)]] +
+                cost[static_cast<std::size_t>(i) + 1];
+            int bl = 1;
+            int bd = 0;
+
+            // 1. Explicit hash match
+            const int ml = best_len[static_cast<std::size_t>(i)];
+            if (ml >= kMinMatch) {
+                const int d = best_dist[static_cast<std::size_t>(i)];
+                const float dc = ofc_cost[offset_code(d).code];
+                const int c_max = match_len_code(ml).code;
+                for (int c = c_min; c <= c_max; ++c) {
+                    int L = ml_range_max[c];
+                    if (L > ml) L = ml;
+                    if (L < kMinMatch) continue;
+                    float mc = mlc_cost[c] + dc +
+                               cost[static_cast<std::size_t>(i + L)];
+                    if (mc < best) {
+                        best = mc;
+                        bl = L;
+                        bd = d;
+                    }
+                }
+            }
+
+            // 2. Repeat offset match
+            const int rl = rep_len[static_cast<std::size_t>(i)];
+            if (rl >= kMinMatch) {
+                const int rd = rep_dist[static_cast<std::size_t>(i)];
+                const int rep_code = (rd == initial_rep.offsets[0]) ? 0 : 1;
+                const float rdc = ofc_cost[rep_code];
+                const int c_max = match_len_code(rl).code;
+                for (int c = c_min; c <= c_max; ++c) {
+                    int L = ml_range_max[c];
+                    if (L > rl) L = rl;
+                    if (L < kMinMatch) continue;
+                    float mc = mlc_cost[c] + rdc +
+                               cost[static_cast<std::size_t>(i + L)];
+                    if (mc < best) {
+                        best = mc;
+                        bl = L;
+                        bd = rd;
+                    }
+                }
+            }
+
+            cost[static_cast<std::size_t>(i)] = best;
+            choice_len[static_cast<std::size_t>(i)] = bl;
+            choice_dist[static_cast<std::size_t>(i)] = bd;
+        }
+
+        // Reconstruct the token stream.
+        seqs.clear();
+        literals.clear();
+        int pos = 0;
+        int lit_start = 0;
+        while (pos < N) {
+            const int L = choice_len[static_cast<std::size_t>(pos)];
+            if (L <= 1) {
+                ++pos;
+                continue;
+            }
+            for (int i = lit_start; i < pos; ++i) {
+                literals.push_back(
+                    mf.data[start + static_cast<std::size_t>(i)]);
+            }
+            Seq s;
+            s.lit_len = pos - lit_start;
+            s.match_len = L;
+            s.match_dist = choice_dist[static_cast<std::size_t>(pos)];
+            seqs.push_back(s);
+            pos += L;
+            lit_start = pos;
+        }
+        for (int i = lit_start; i < N; ++i) {
+            literals.push_back(mf.data[start + static_cast<std::size_t>(i)]);
+        }
+
+        // Recompute statistics from this parse for the next iteration.
+        if (pass + 1 < passes) {
+            std::fill_n(lit_freq, 256, 0);
+            std::fill_n(ll_freq, 36, 0);
+            std::fill_n(of_freq, 32, 0);
+            std::fill_n(ml_freq, 53, 0);
+            for (std::uint8_t b : literals) lit_freq[b]++;
+            n_lit = static_cast<int>(literals.size());
+            RepeatOffsets pass_rep = initial_rep;
+            for (const Seq& s : seqs) {
+                ll_freq[lit_len_code(s.lit_len).code]++;
+                Code oc = choose_offset(s.match_dist, s.lit_len, pass_rep);
+                of_freq[oc.code]++;
+                ml_freq[match_len_code(s.match_len).code]++;
+            }
+            n_seq = static_cast<int>(seqs.size());
+        }
+    }
+
+    RepeatOffsets end_rep = initial_rep;
+    for (const Seq& s : seqs) {
+        choose_offset(s.match_dist, s.lit_len, end_rep);
+    }
+    rep = end_rep;
+
+    return seqs;
 }
 
 // --- Predefined normalized distributions (RFC 8878 §4.1.1) ---
@@ -876,13 +1042,15 @@ auto compress(std::span<const std::byte> data, int level,
         // because each block extends the shared finder for the next one.
         MatchFinder mf;
         mf.reset(p, size, 1 << window_log);
+        RepeatOffsets rep;
         for (Block& b : blocks) {
             if (optimal) {
                 b.seqs = build_sequences_optimal(mf, b.off, b.off + b.len,
-                                                 effort, passes, b.literals);
+                                                 effort, passes, b.literals,
+                                                 rep);
             } else {
                 b.seqs = build_sequences(mf, b.off, b.off + b.len, effort,
-                                         lazy, b.literals);
+                                         lazy, b.literals, rep);
             }
         }
     } else {
@@ -890,12 +1058,13 @@ auto compress(std::span<const std::byte> data, int level,
         auto tokenize_block = [&](Block& b) {
             MatchFinder mf;
             mf.reset(p + b.off, b.len, kBlockSize);
+            RepeatOffsets rep;
             if (optimal) {
                 b.seqs = build_sequences_optimal(mf, 0, b.len, effort, passes,
-                                                 b.literals);
+                                                 b.literals, rep);
             } else {
                 b.seqs = build_sequences(mf, 0, b.len, effort, lazy,
-                                         b.literals);
+                                         b.literals, rep);
             }
         };
 
