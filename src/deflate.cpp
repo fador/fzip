@@ -389,7 +389,8 @@ auto distance_to_symbol(int dist) -> int;
 
 auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
                  std::array<std::uint32_t, 288>& lit_freq,
-                 std::array<std::uint32_t, 32>& dist_freq)
+                 std::array<std::uint32_t, 32>& dist_freq,
+                 std::size_t hist = 0)
     -> std::vector<Token> {
     std::vector<Token> tokens;
     tokens.reserve(size / 2);
@@ -398,6 +399,13 @@ auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
 
     std::vector<int> head(kHashSize, -1);
     std::vector<int> prev(kWindow, -1);
+
+    const auto* full_data = data - hist;
+    const std::size_t full_size = size + hist;
+
+    for (std::size_t i = 0; i < hist; ++i) {
+        insert_hash(full_data, full_size, i, head, prev);
+    }
 
     // Level tuning: chain effort and lazy depth.
     int effort;
@@ -426,12 +434,12 @@ auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
         dist_freq[distance_to_symbol(dist)]++;
     };
 
-    std::size_t pos = 0;
-    while (pos < size) {
-        Match m = find_match(data, size, pos, head, prev, effort);
+    std::size_t pos = hist;
+    while (pos < full_size) {
+        Match m = find_match(full_data, full_size, pos, head, prev, effort);
         if (m.len < kMinMatch) {
-            emit_lit(data[pos]);
-            insert_hash(data, size, pos, head, prev);
+            emit_lit(full_data[pos]);
+            insert_hash(full_data, full_size, pos, head, prev);
             ++pos;
             continue;
         }
@@ -440,15 +448,15 @@ auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
             // Insert pos, then look one byte ahead for a longer match. If the
             // next position yields a longer match, emit a literal here and take
             // that match instead (classic lazy matching, deflate_slow-style).
-            insert_hash(data, size, pos, head, prev);
-            Match m2 = find_match(data, size, pos + 1, head, prev, effort);
+            insert_hash(full_data, full_size, pos, head, prev);
+            Match m2 = find_match(full_data, full_size, pos + 1, head, prev, effort);
             if (m2.len > m.len) {
-                emit_lit(data[pos]);
+                emit_lit(full_data[pos]);
                 ++pos;
                 m = m2;
                 emit_match(m.len, m.dist);
                 for (int i = 0; i < m.len; ++i) {
-                    insert_hash(data, size, pos + i, head, prev);
+                    insert_hash(full_data, full_size, pos + i, head, prev);
                 }
                 pos += m.len;
                 continue;
@@ -456,7 +464,7 @@ auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
             // Keep the match at pos; pos was already inserted above.
             emit_match(m.len, m.dist);
             for (int i = 1; i < m.len; ++i) {
-                insert_hash(data, size, pos + i, head, prev);
+                insert_hash(full_data, full_size, pos + i, head, prev);
             }
             pos += m.len;
             continue;
@@ -464,7 +472,7 @@ auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
 
         emit_match(m.len, m.dist);
         for (int i = 0; i < m.len; ++i) {
-            insert_hash(data, size, pos + i, head, prev);
+            insert_hash(full_data, full_size, pos + i, head, prev);
         }
         pos += m.len;
     }
@@ -637,7 +645,8 @@ auto find_match_candidates(const std::uint8_t* data, std::size_t size,
 // --------------------------------------------------------------------------
 auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
                   int iterations, std::array<std::uint32_t, 288>& lit_freq,
-                  std::array<std::uint32_t, 32>& dist_freq)
+                  std::array<std::uint32_t, 32>& dist_freq,
+                  std::size_t hist = 0)
     -> std::vector<Token> {
     lit_freq.fill(0);
     dist_freq.fill(0);
@@ -646,6 +655,9 @@ auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
         lit_freq[256]++;
         return {};
     }
+
+    const auto* full_data = data - hist;
+    const std::size_t full_size = size + hist;
 
     // Forward pass: Pareto-optimal matches at every position, stored in a
     // shared pool indexed by `cand_start`.
@@ -657,17 +669,23 @@ auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
         std::vector<int> prev3(kWindow, -1);
         std::vector<int> head4(kHashSize, -1);
         std::vector<int> prev4(kWindow, -1);
+
+        for (std::size_t i = 0; i < hist; ++i) {
+            insert_hash(full_data, full_size, i, head3, prev3);
+            insert_hash4(full_data, full_size, i, head4, prev4);
+        }
+
         for (int p = 0; p < N; ++p) {
             cand_start[static_cast<std::size_t>(p)] =
                 static_cast<int>(pool.size());
             MatchCand local[kMaxCands];
+            const std::size_t up = hist + static_cast<std::size_t>(p);
             const int nc = find_match_candidates(
-                data, size, static_cast<std::size_t>(p), head3, prev3, head4,
+                full_data, full_size, up, head3, prev3, head4,
                 prev4, effort, local);
             for (int j = 0; j < nc; ++j) pool.push_back(local[j]);
-            const std::size_t up = static_cast<std::size_t>(p);
-            insert_hash(data, size, up, head3, prev3);
-            insert_hash4(data, size, up, head4, prev4);
+            insert_hash(full_data, full_size, up, head3, prev3);
+            insert_hash4(full_data, full_size, up, head4, prev4);
         }
         cand_start[static_cast<std::size_t>(N)] =
             static_cast<int>(pool.size());
@@ -1067,13 +1085,14 @@ auto deflate_compress(std::span<const std::byte> data, int level)
         }
 
         auto tokenize = [&](BlockJob& job) {
+            std::size_t hist = std::min<std::size_t>(32768, job.off);
             if (use_optimal) {
                 job.tokens = lz77_optimal(p + job.off, job.len, opt_effort,
                                           opt_iterations, job.lit_freq,
-                                          job.dist_freq);
+                                          job.dist_freq, hist);
             } else {
                 job.tokens = lz77_encode(p + job.off, job.len, level,
-                                         job.lit_freq, job.dist_freq);
+                                         job.lit_freq, job.dist_freq, hist);
             }
         };
         if (wave.size() < 2 || hw <= 1) {
