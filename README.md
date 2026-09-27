@@ -188,4 +188,4 @@ deflate on text and binaries.
 
 ## License
 
-TBD (project code).
+This project is licensed under the [MIT License](LICENSE).
