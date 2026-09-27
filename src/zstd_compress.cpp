@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -188,6 +189,9 @@ inline auto sym_cost(int freq, int total) -> float {
 // --- Code tables (RFC 8878 §4.2.2) ---
 
 inline Code lit_len_code(int len) {
+    if (len < 16) {
+        return {len, 0, 0};
+    }
     static const int kBase[36] = {
         0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
         16, 18, 20, 22, 24, 28, 32, 40, 48, 64, 128, 256, 512, 1024, 2048,
@@ -195,13 +199,16 @@ inline Code lit_len_code(int len) {
     static const int kExtra[36] = {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    for (int c = 35; c >= 0; --c) {
+    for (int c = 35; c >= 16; --c) {
         if (len >= kBase[c]) return {c, kExtra[c], len - kBase[c]};
     }
     return {0, 0, 0};
 }
 
 inline Code match_len_code(int len) {
+    if (len >= 3 && len <= 34) {
+        return {len - 3, 0, 0};
+    }
     static const int kBase[53] = {
         3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17, 18,
         19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
@@ -211,7 +218,7 @@ inline Code match_len_code(int len) {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-    for (int c = 52; c >= 0; --c) {
+    for (int c = 52; c >= 32; --c) {
         if (len >= kBase[c]) return {c, kExtra[c], len - kBase[c]};
     }
     return {0, 0, 0};
@@ -221,8 +228,7 @@ inline Code match_len_code(int len) {
 // Codes 0..1 are repeat codes; explicit offsets use code >= 2.
 inline Code offset_code(int dist) {
     int v = dist + 3;
-    int code = 0;
-    while ((1 << (code + 1)) <= v) ++code;
+    int code = std::bit_width(static_cast<std::uint32_t>(v)) - 1;
     if (code < 2) code = 2;  // never use repeat codes for explicit offsets
     return {code, code, v - (1 << code)};
 }
