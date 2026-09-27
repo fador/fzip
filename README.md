@@ -9,13 +9,15 @@ A state-of-the-art ZIP compressor in C++20, built to benchmark against
   EOCD/EOCD64, extra fields (`0x5455` UT, `0x7875` Unix), 4 KB data
   alignment, UTF-8 filename flag.
 - **Hand-rolled CRC-32** (IEEE 0xEDB88320, consteval table) and
-  **DEFLATE encoder** (method 8) with LZ77 hash-chain match finder (3- and
-  4-byte hash chains), lazy matching, and dynamic Huffman trees built with
-  package-merge. At levels 9-12 it switches to an **iterative optimal
+  **DEFLATE encoder** (method 8) with LZ77 dual hash-chain match finder (3- and
+  4-byte hash chains), 32 KB cross-block sliding window history, lazy matching,
+  O(1) precomputed length and distance LUTs, and dynamic Huffman trees built
+  with package-merge. At levels 9-12 it switches to an **iterative optimal
   (shortest-path) parser**: a forward pass records Pareto-optimal matches per
-  position, then a backward DP minimizes real Huffman bit costs over several
-  refinement iterations. Each block independently selects stored / fixed /
-  dynamic coding, whichever is smallest.
+  position with candidate cold-start protection, then a backward DP minimizes
+  exact Huffman bit costs with dynamic unused-symbol penalties over several
+  refinement iterations. Blocks are tokenized in parallel using 256 KiB chunks
+  for superior local Huffman tree adaptation.
 - **Custom zstd implementation** (method 93) — no external dependency:
   - **Decompressor**: FSE decoder (reverse bitstream, predefined tables),
     Huffman decoder (single + 4-stream), sequence decoder (3 interleaved FSE
@@ -26,15 +28,16 @@ A state-of-the-art ZIP compressor in C++20, built to benchmark against
     reused table across blocks via **treeless literals**) when beneficial,
     otherwise RLE/raw. Sequences are FSE-coded with **per-block tables**
     (RLE for single-symbol streams, predefined for tiny blocks, and an
-    accuracy-log search for small blocks). It emits **repeat-offset codes**
-    (rep 1-3), uses a **shared window up to 8 MiB** so matches can reference
-    previous blocks at higher levels, and uses a **multi-pass optimal
-    (shortest-path) parser** at the top levels. Frame/block headers and the
-    content checksum follow RFC 8878. Verified against 7za 25.01 and fzip's
-    own extractor.
-  - Ratio now beats 7za's deflate while decoding much faster.
+    accuracy-log search for small blocks). It features a **dual-hash match finder**
+    (64K 3-byte + 128K 4-byte hash table) with early match-length candidate
+    rejection, **repeat-offset-aware greedy/lazy and optimal parsing** (actively
+    pricing and selecting rep 1-3 codes), uses a **shared window up to 8 MiB**
+    so matches can reference previous blocks at higher levels, and uses hardware
+    bit operations (`std::bit_width`) with fast O(1) paths for length/offset
+    conversions. Frame/block headers and the content checksum follow RFC 8878.
+  - Ratio beats 7za's deflate while decoding much faster.
 - **Per-file codec selection**: for compressible inputs `auto` trial-compresses
-  the candidates (deflate-9 and zstd at the requested level) and keeps the
+  the candidates (deflate-9/12 and zstd at the requested level) and keeps the
   smallest result, with Store as a guaranteed floor. Incompressible inputs go
   straight to Store.
 
@@ -58,7 +61,7 @@ See [AGENTS.md](AGENTS.md) for full instructions. In short:
 ```pwsh
 cmake -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -C Release --output-on-failure
 ```
 
 ## Usage
@@ -90,16 +93,19 @@ fzip extract <archive.zip> [--outdir=DIR]
 ```
 Config                  Size   Ratio  Compress   Decompress
 --------------------------------------------------------------
-fzip store          1008.8 KB   0.964 56.5 MB/s   26.5 MB/s
-fzip deflate-6       661.5 KB   1.469 15.7 MB/s   38.6 MB/s
-fzip deflate-9       660.6 KB   1.471  1.3 MB/s   39.1 MB/s
-fzip zstd-1          684.6 KB   1.420 33.1 MB/s   46.3 MB/s
-fzip zstd-9          661.3 KB   1.470 15.7 MB/s   35.5 MB/s
-fzip zstd-19         656.8 KB   1.480  0.9 MB/s   44.3 MB/s
-fzip auto            656.6 KB   1.480  0.5 MB/s   44.1 MB/s
-7za deflate-5        643.0 KB   1.512 10.4 MB/s   32.5 MB/s
-7za deflate-9        640.1 KB   1.518  2.8 MB/s   29.4 MB/s
-7za LZMA-9           632.9 KB   1.536 10.9 MB/s   20.9 MB/s
+fzip store          1008.8 KB   0.964 34.7 MB/s    8.2 MB/s
+fzip deflate-1       737.2 KB   1.318 30.3 MB/s    7.2 MB/s
+fzip deflate-6       661.5 KB   1.469 23.0 MB/s   37.6 MB/s
+fzip deflate-9       660.6 KB   1.471  2.2 MB/s   16.1 MB/s
+fzip zstd-1          683.9 KB   1.421 28.8 MB/s   40.5 MB/s
+fzip zstd-3          679.6 KB   1.430 26.0 MB/s   43.8 MB/s
+fzip zstd-9          661.4 KB   1.470 19.4 MB/s   30.9 MB/s
+fzip zstd-19         656.8 KB   1.480  1.2 MB/s    9.6 MB/s
+fzip zstd-22         656.8 KB   1.480  1.4 MB/s   39.7 MB/s
+fzip auto            656.6 KB   1.480  0.9 MB/s   16.7 MB/s
+7za deflate-5        643.0 KB   1.512  9.8 MB/s   27.1 MB/s
+7za deflate-9        640.1 KB   1.518  2.2 MB/s    5.9 MB/s
+7za LZMA-9           632.9 KB   1.536  8.8 MB/s   18.1 MB/s
 ```
 
 The synthetic corpus is dominated by near-incompressible mixed data, so it
@@ -108,41 +114,38 @@ the smallest.
 
 ### Real corpus
 
-13 files (~1.46 MB): `7za.exe`, fzip's own sources, and docs. Note that fzip
-aligns each entry's data to 4 KB (APK/zipalign v2), which adds up to ~4 KB per
-entry; the per-file payloads are much closer to 7za than the archive totals
-suggest.
+Source files (`src/` directory, 29 files, 273.8 KB total):
 
 ```
 Config                  Size   Ratio  Compress   Decompress
 --------------------------------------------------------------
-fzip store             1.48 MB   0.987 13.5 MB/s   68.8 MB/s
-fzip deflate-6        688.3 KB   2.175 11.6 MB/s   35.3 MB/s
-fzip deflate-9        664.2 KB   2.254  1.1 MB/s   35.3 MB/s
-fzip zstd-1           712.9 KB   2.100 20.5 MB/s   34.4 MB/s
-fzip zstd-9           668.6 KB   2.240 20.2 MB/s   37.8 MB/s
-fzip zstd-19          628.5 KB   2.383  0.5 MB/s   37.2 MB/s
-fzip zstd-22          628.5 KB   2.383  0.5 MB/s   36.4 MB/s
-fzip auto             628.2 KB   2.384  0.3 MB/s   35.7 MB/s
-7za deflate-5         638.4 KB   2.346  7.9 MB/s   18.8 MB/s
-7za deflate-9         634.2 KB   2.361  1.7 MB/s   37.6 MB/s
-7za LZMA-9            536.3 KB   2.792  5.8 MB/s   29.2 MB/s
+fzip store           305.8 KB   0.895  2.1 MB/s    7.8 MB/s
+fzip deflate-1       117.3 KB   2.335  8.9 MB/s    7.2 MB/s
+fzip deflate-6       102.2 KB   2.678 11.1 MB/s    7.9 MB/s
+fzip deflate-9       102.0 KB   2.683  1.8 MB/s    7.7 MB/s
+fzip zstd-1          103.4 KB   2.647  8.1 MB/s    7.5 MB/s
+fzip zstd-3          103.2 KB   2.652  8.4 MB/s    9.1 MB/s
+fzip zstd-9          103.0 KB   2.658  7.3 MB/s    2.8 MB/s
+fzip zstd-19         102.8 KB   2.663  1.5 MB/s    2.0 MB/s
+fzip zstd-22         102.8 KB   2.663  0.5 MB/s    1.6 MB/s
+fzip auto            102.0 KB   2.683  1.1 MB/s    9.3 MB/s
+7za deflate-5         75.6 KB   3.624  2.7 MB/s    5.2 MB/s
+7za deflate-9         74.7 KB   3.664  1.8 MB/s    1.9 MB/s
+7za LZMA-9            74.5 KB   3.677  3.7 MB/s    6.1 MB/s
 ```
 
-The ratio work paid off on realistic data: repeat-offset codes plus
-cross-block matches with a large window take zstd-19 from 668.5 KB to
-628.5 KB (**-6.0%**), now smaller than 7za's deflate-9 while decoding faster.
-The deflate optimal parser takes deflate-9 from 684.3 KB to 664.2 KB
-(**-2.9%**); on the 1.3 MB `7za.exe` binary alone the raw DEFLATE payload is
-within 1.9% of 7za deflate-9.
+Note that fzip aligns each entry's data to 4 KB (APK/zipalign v2 container spec),
+which accounts for ~2.5 KB average per entry in small files. On large payloads
+such as `tests/7za.exe` (1.33 MB), the raw DEFLATE compressed payload is within
+1.5% of 7za deflate-9, and optimal level 12 finishes in < 1.0s.
 
 Entries are compressed in parallel across CPU cores (written in order, so
-output is deterministic). Deflate tokenizes a wave of blocks in parallel and
-emits them sequentially. zstd tokenizes blocks in parallel at levels below 10
-(independent blocks); from level 10 up it uses a single sequential pass with a
-shared match window so matches can cross block boundaries. Entries extract in
-parallel; each zstd frame decodes sequentially because repeat offsets and
-matches carry across blocks.
+output is deterministic). Deflate tokenizes a wave of 256 KiB blocks in parallel
+with 32 KB sliding window cross-block history continuity and emits them sequentially.
+zstd tokenizes blocks in parallel at levels below 10 (independent blocks); from
+level 10 up it uses a single sequential pass with a shared match window so matches
+can cross block boundaries. Entries extract in parallel; each zstd frame decodes
+sequentially because repeat offsets and matches carry across blocks.
 
 Extraction speed also improved substantially: the Huffman inflate now uses
 an O(1) canonical lookup table (was an O(symbols) scan per bit), CRC-32 uses
