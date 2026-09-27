@@ -484,8 +484,10 @@ auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
 // Length code table (RFC 1951 §3.2.5). For each length 3..258 we get a
 // symbol (257..285), extra bits, and base.
 struct LenCode { int sym; int extra; int base; };
-auto length_code(int len) -> LenCode {
-    // Table from the RFC.
+struct DistCode { int sym; int extra; int base; };
+
+inline auto init_len_table() {
+    std::array<LenCode, 259> table{};
     static const struct { int min; int max; int sym; int extra; int base; } tab[] = {
         {3, 3, 257, 0, 3}, {4, 4, 258, 0, 4}, {5, 5, 259, 0, 5},
         {6, 6, 260, 0, 6}, {7, 7, 261, 0, 7}, {8, 8, 262, 0, 8},
@@ -499,20 +501,15 @@ auto length_code(int len) -> LenCode {
         {227, 257, 284, 5, 227}, {258, 258, 285, 0, 258},
     };
     for (auto& e : tab) {
-        if (len >= e.min && len <= e.max) {
-            return {e.sym, e.extra, e.base};
+        for (int l = e.min; l <= e.max; ++l) {
+            table[l] = {e.sym, e.extra, e.base};
         }
     }
-    throw std::runtime_error("invalid DEFLATE length");
+    return table;
 }
 
-auto length_to_symbol(int len) -> int {
-    return length_code(len).sym - 257;
-}
-
-// Distance code table (RFC 1951 §3.2.5). For each distance 1..32768.
-struct DistCode { int sym; int extra; int base; };
-auto distance_code(int dist) -> DistCode {
+inline auto init_dist_table() {
+    std::array<DistCode, 32769> table{};
     static const struct { int min; int max; int sym; int extra; int base; } tab[] = {
         {1, 1, 0, 0, 1}, {2, 2, 1, 0, 2}, {3, 3, 2, 0, 3}, {4, 4, 3, 0, 4},
         {5, 6, 4, 1, 5}, {7, 8, 5, 1, 7}, {9, 12, 6, 2, 9}, {13, 16, 7, 2, 13},
@@ -527,15 +524,30 @@ auto distance_code(int dist) -> DistCode {
         {16385, 24576, 28, 13, 16385}, {24577, 32768, 29, 13, 24577},
     };
     for (auto& e : tab) {
-        if (dist >= e.min && dist <= e.max) {
-            return {e.sym, e.extra, e.base};
+        for (int d = e.min; d <= e.max; ++d) {
+            table[d] = {e.sym, e.extra, e.base};
         }
     }
-    throw std::runtime_error("invalid DEFLATE distance");
+    return table;
 }
 
-auto distance_to_symbol(int dist) -> int {
-    return distance_code(dist).sym;
+const auto kLenTable = init_len_table();
+const auto kDistTable = init_dist_table();
+
+inline auto length_code(int len) -> LenCode {
+    return kLenTable[static_cast<std::size_t>(len)];
+}
+
+inline auto length_to_symbol(int len) -> int {
+    return kLenTable[static_cast<std::size_t>(len)].sym - 257;
+}
+
+inline auto distance_code(int dist) -> DistCode {
+    return kDistTable[static_cast<std::size_t>(dist)];
+}
+
+inline auto distance_to_symbol(int dist) -> int {
+    return kDistTable[static_cast<std::size_t>(dist)].sym;
 }
 
 // One candidate match for the optimal parser.
@@ -705,6 +717,14 @@ auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
             ++p;
         }
     }
+    // Ensure symbols present in candidates have non-zero initial frequency
+    // without swamping the realistic greedy distribution.
+    for (const auto& c : pool) {
+        int lsym = 257 + length_to_symbol(c.len);
+        if (lit_freq[static_cast<std::size_t>(lsym)] == 0) lit_freq[static_cast<std::size_t>(lsym)] = 1;
+        int dsym = distance_to_symbol(c.dist);
+        if (dist_freq[static_cast<std::size_t>(dsym)] == 0) dist_freq[static_cast<std::size_t>(dsym)] = 1;
+    }
     lit_freq[256]++;
 
     std::vector<int> choice_len(static_cast<std::size_t>(N), 1);
@@ -712,19 +732,45 @@ auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
     std::vector<double> dp(static_cast<std::size_t>(N) + 1, 0.0);
     std::vector<Token> tokens;
 
+    std::array<double, 256> lit_cost{};
+    std::array<double, 259> len_cost{};
+    std::array<double, 32769> dist_cost{};
+
     if (iterations < 1) iterations = 1;
-    constexpr int kUnusedCost = 15;  // max code length: avoid unused symbols
     for (int it = 0; it < iterations; ++it) {
         auto lit_lens = build_huff_lengths(lit_freq, 286, 15);
         std::array<std::uint32_t, 32> df{};
         for (int i = 0; i < 30; ++i) df[i] = dist_freq[i];
         auto dist_lens = build_huff_lengths(df, 30, 15);
 
+        int max_lit_len = 0;
+        for (int s = 0; s < 286; ++s) {
+            if (lit_lens[s] > max_lit_len) max_lit_len = lit_lens[s];
+        }
+        int max_dist_len = 0;
+        for (int s = 0; s < 30; ++s) {
+            if (dist_lens[s] > max_dist_len) max_dist_len = dist_lens[s];
+        }
+        const double unused_lit_cost = std::min(15.0, static_cast<double>(max_lit_len + 1));
+        const double unused_dist_cost = std::min(15.0, static_cast<double>(max_dist_len + 1));
+
+        for (int s = 0; s < 256; ++s) {
+            lit_cost[s] = (lit_lens[s] == 0) ? unused_lit_cost : lit_lens[s];
+        }
+        for (int l = 3; l <= 258; ++l) {
+            int sym = kLenTable[static_cast<std::size_t>(l)].sym;
+            double bits = (lit_lens[sym] == 0) ? unused_lit_cost : lit_lens[sym];
+            len_cost[l] = bits + kLenTable[static_cast<std::size_t>(l)].extra;
+        }
+        for (int d = 1; d <= 32768; ++d) {
+            int sym = kDistTable[static_cast<std::size_t>(d)].sym;
+            double bits = (dist_lens[sym] == 0) ? unused_dist_cost : dist_lens[sym];
+            dist_cost[d] = bits + kDistTable[static_cast<std::size_t>(d)].extra;
+        }
+
         dp[static_cast<std::size_t>(N)] = 0.0;
         for (int i = N - 1; i >= 0; --i) {
-            int lit_bits = lit_lens[data[i]];
-            if (lit_bits == 0) lit_bits = kUnusedCost;
-            double best = lit_bits + dp[static_cast<std::size_t>(i) + 1];
+            double best = lit_cost[data[i]] + dp[static_cast<std::size_t>(i) + 1];
             int bl = 1;
             int bd = 0;
             // Walk Pareto candidates by increasing distance; candidate k
@@ -737,15 +783,9 @@ auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
                 const int d = c.dist;
                 const int max_l = std::min(c.len, kMaxMatch);
                 if (max_l <= prev_len) continue;
-                const int dsym = distance_to_symbol(d);
-                int dbits = dist_lens[dsym];
-                if (dbits == 0) dbits = kUnusedCost;
-                dbits += distance_code(d).extra;
+                const double dbits = dist_cost[d];
                 for (int L = prev_len + 1; L <= max_l; ++L) {
-                    auto lc = length_code(L);
-                    int lbits = lit_lens[lc.sym];
-                    if (lbits == 0) lbits = kUnusedCost;
-                    double cst = lbits + lc.extra + dbits +
+                    double cst = len_cost[L] + dbits +
                                  dp[static_cast<std::size_t>(i + L)];
                     if (cst < best) {
                         best = cst;
@@ -1018,9 +1058,9 @@ void emit_dynamic_block(BitWriter& w, bool final,
     w.put_huff(lit.codes[256], lit.lengths[256]);
 }
 
-// Decide block size: we emit one dynamic block per call. For very large
-// inputs we could split, but a single block is correct (just memory-heavy).
-constexpr std::size_t kBlockSize = 1 << 20;  // 1 MiB worth of input per block
+// Block size: 256 KiB gives better Huffman tree adaptation for mixed data
+// while maintaining low header overhead and thread-level parallelism.
+constexpr std::size_t kBlockSize = 256 * 1024;  // 256 KiB per block
 
 }  // namespace
 
