@@ -3,6 +3,8 @@
 A state-of-the-art ZIP compressor in C++20, built to benchmark against
 7-Zip and other modern archivers.
 
+![fzip Process & Architecture Diagram](assets/process_diagram.svg)
+
 ## Design
 
 - **Hand-rolled ZIP/ZIP64 container** — local headers, central directory,
