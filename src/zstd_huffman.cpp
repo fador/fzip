@@ -157,9 +157,11 @@ auto write_weights(const HufTable& t, std::vector<std::byte>& out) -> bool {
             static_cast<std::uint8_t>(weights[static_cast<std::size_t>(i)]);
     }
     std::vector<std::byte> fse_body;
+    const std::size_t direct_bytes =
+        static_cast<std::size_t>((num_weights + 1) / 2);
     if (fse_compress_weights(wseq, fse_body) && fse_body.size() > 1 &&
-        fse_body.size() < static_cast<std::size_t>(num_weights / 2) &&
-        fse_body.size() < 128) {
+        fse_body.size() < 128 &&
+        (max_sym > 128 || fse_body.size() < direct_bytes)) {
         out.push_back(static_cast<std::byte>(fse_body.size()));
         out.insert(out.end(), fse_body.begin(), fse_body.end());
         return true;
@@ -298,7 +300,9 @@ auto fse_compress_weights(const std::vector<std::uint8_t>& weights,
     std::vector<unsigned> count(256, 0);
     int max_symbol = 0;
     int max_count = 0;
+    int present = 0;
     for (std::uint8_t w : weights) {
+        if (count[w] == 0) ++present;
         count[w]++;
         if (w > max_symbol) max_symbol = w;
         if (static_cast<int>(count[w]) > max_count) max_count = count[w];
@@ -306,25 +310,35 @@ auto fse_compress_weights(const std::vector<std::uint8_t>& weights,
     if (max_count == wt_size) return false;  // RLE
     if (max_count == 1) return false;        // not compressible
 
-    const int table_log = 6;  // MAX_FSE_TABLELOG_FOR_HUFF_HEADER
-    std::vector<int> norm;
-    fse_normalize(count.data(), wt_size, max_symbol, table_log, norm);
+    int min_log = 5;
+    while ((1 << min_log) < present) ++min_log;
+    const int max_log = 6;  // MAX_FSE_TABLELOG_FOR_HUFF_HEADER
+    if (min_log > max_log) min_log = max_log;
 
-    std::vector<std::int16_t> norm16(static_cast<std::size_t>(max_symbol) + 1);
-    for (int i = 0; i <= max_symbol; ++i) {
-        norm16[static_cast<std::size_t>(i)] =
-            static_cast<std::int16_t>(norm[static_cast<std::size_t>(i)]);
+    std::vector<std::byte> best_body;
+    for (int table_log = min_log; table_log <= max_log; ++table_log) {
+        std::vector<int> norm;
+        fse_normalize(count.data(), wt_size, max_symbol, table_log, norm);
+
+        std::vector<std::int16_t> norm16(static_cast<std::size_t>(max_symbol) + 1);
+        for (int i = 0; i <= max_symbol; ++i) {
+            norm16[static_cast<std::size_t>(i)] =
+                static_cast<std::int16_t>(norm[static_cast<std::size_t>(i)]);
+        }
+        FseCTable ct = build_fse_ctable(table_log, norm16.data(), max_symbol);
+
+        std::vector<std::byte> body;
+        fse_write_ncount(body, norm.data(), max_symbol, table_log);
+        FseBitWriter w;
+        fse_encode_2state(w, ct, weights.data(), wt_size);
+        const auto& bytes = w.data();
+        body.insert(body.end(), bytes.begin(), bytes.end());
+        if (best_body.empty() || body.size() < best_body.size()) {
+            best_body = std::move(body);
+        }
     }
-    FseCTable ct = build_fse_ctable(table_log, norm16.data(), max_symbol);
-
-    std::vector<std::byte> body;
-    fse_write_ncount(body, norm.data(), max_symbol, table_log);
-    FseBitWriter w;
-    fse_encode_2state(w, ct, weights.data(), wt_size);
-    const auto& bytes = w.data();
-    body.insert(body.end(), bytes.begin(), bytes.end());
-    out = std::move(body);
-    return true;
+    out = std::move(best_body);
+    return !out.empty();
 }
 
 // Decompress an FSE weight stream.
@@ -386,23 +400,29 @@ auto huf_literals_table(const std::uint8_t* literals, int num_literals,
 }
 
 auto huf_encode_streams(const HufTable& t, const std::uint8_t* literals,
-                        int num_literals, std::vector<std::byte>& out) -> bool {
+                        int num_literals, std::vector<std::byte>& out,
+                        bool single_stream) -> bool {
     if (t.table_log == 0) return false;
+    for (int j = 0; j < num_literals; ++j) {
+        if (t.lengths[literals[j]] == 0) return false;
+    }
+    out.clear();
+    if (single_stream) {
+        encode_stream(t, literals, num_literals, out);
+        return true;
+    }
+
     int sizes[4];
     stream_sizes(num_literals, sizes);
     std::vector<std::byte> streams[4];
     int offset = 0;
     for (int i = 0; i < 4; ++i) {
         if (sizes[i] > 0) {
-            for (int j = 0; j < sizes[i]; ++j) {
-                if (t.lengths[literals[offset + j]] == 0) return false;
-            }
             encode_stream(t, literals + offset, sizes[i], streams[i]);
         }
         offset += sizes[i];
     }
 
-    out.clear();
     // Jump table: sizes of streams 1-3 as 2-byte little-endian.
     for (int i = 0; i < 3; ++i) {
         std::uint32_t s = static_cast<std::uint32_t>(streams[i].size());
@@ -416,12 +436,14 @@ auto huf_encode_streams(const HufTable& t, const std::uint8_t* literals,
 }
 
 auto huf_encode_with_table(const HufTable& t, const std::uint8_t* literals,
-                           int num_literals, std::vector<std::byte>& out)
-    -> bool {
+                           int num_literals, std::vector<std::byte>& out,
+                           bool single_stream) -> bool {
     std::vector<std::byte> weights;
     if (!write_weights(t, weights)) return false;
     std::vector<std::byte> body;
-    if (!huf_encode_streams(t, literals, num_literals, body)) return false;
+    if (!huf_encode_streams(t, literals, num_literals, body, single_stream)) {
+        return false;
+    }
     out.clear();
     out.insert(out.end(), weights.begin(), weights.end());
     out.insert(out.end(), body.begin(), body.end());
@@ -432,7 +454,7 @@ auto huf_compress_literals(const std::uint8_t* literals, int num_literals,
                            std::vector<std::byte>& out) -> bool {
     HufTable t;
     if (!huf_literals_table(literals, num_literals, t)) return false;
-    return huf_encode_with_table(t, literals, num_literals, out);
+    return huf_encode_with_table(t, literals, num_literals, out, false);
 }
 
 auto huf_read_weights(const std::byte* data, std::size_t size, HufTable& t,

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -315,42 +316,23 @@ struct Match {
     int len = 0;    // 3..258
 };
 
-// Find the best match at `pos` using the hash chain `head`/`prev`.
-// `max_effort` limits chain traversal (level-dependent).
-auto find_match(const std::uint8_t* data, std::size_t size, std::size_t pos,
-                const std::vector<int>& head, const std::vector<int>& prev,
-                int max_effort) -> Match {
-    Match best;
-    if (pos + kMinMatch > size) return best;
-    std::uint32_t h = hash3(data + pos);
-    int cand = head[h];
-    int limit = static_cast<int>(pos) - kWindow;
-    if (limit < 0) limit = 0;
-    int tries = max_effort;
-    while (cand >= 0 && tries-- > 0) {
-        if (cand < limit) break;
-        // Quick check: does the candidate extend the best match prefix?
-        if (best.len >= kMinMatch &&
-            (data[cand + best.len] != data[pos + best.len] ||
-             data[cand + best.len - 1] != data[pos + best.len - 1])) {
-            cand = prev[static_cast<std::size_t>(cand) & (kWindow - 1)];
-            continue;
+inline auto match_len_fast(const std::uint8_t* a, const std::uint8_t* b,
+                           int maxl) -> int {
+    int l = 0;
+    while (l + 8 <= maxl) {
+        std::uint64_t va, vb;
+        std::memcpy(&va, a + l, 8);
+        std::memcpy(&vb, b + l, 8);
+        if (va != vb) {
+            return l + (std::countr_zero(va ^ vb) >> 3);
         }
-        // Measure match length.
-        int maxl = static_cast<int>(std::min<std::size_t>(kMaxMatch, size - pos));
-        int l = 0;
-        while (l < maxl && data[cand + l] == data[pos + l]) ++l;
-        if (l >= kMinMatch && l > best.len) {
-            best.len = l;
-            best.dist = static_cast<int>(pos) - cand;
-            if (l >= kMaxMatch) break;
-        }
-        cand = prev[static_cast<std::size_t>(cand) & (kWindow - 1)];
+        l += 8;
     }
-    return best;
+    while (l < maxl && a[l] == b[l]) ++l;
+    return l;
 }
 
-// Insert `pos` into the hash chain.
+// Insert `pos` into the 3-byte hash chain.
 void insert_hash(const std::uint8_t* data, std::size_t size, std::size_t pos,
                  std::vector<int>& head, std::vector<int>& prev) {
     if (pos + kMinMatch > size) return;
@@ -370,6 +352,62 @@ void insert_hash4(const std::uint8_t* data, std::size_t size, std::size_t pos,
     head[h] = p;
 }
 
+// Find the best match at `pos` using the dual hash chains `head4`/`prev4` and
+// `head3`/`prev3`. `max_effort` limits chain traversal (level-dependent).
+auto find_match(const std::uint8_t* data, std::size_t size, std::size_t pos,
+                const std::vector<int>& head3, const std::vector<int>& prev3,
+                const std::vector<int>& head4, const std::vector<int>& prev4,
+                int max_effort) -> Match {
+    Match best;
+    if (pos + kMinMatch > size) return best;
+    const int maxl =
+        static_cast<int>(std::min<std::size_t>(kMaxMatch, size - pos));
+    int limit = static_cast<int>(pos) - kWindow;
+    if (limit < 0) limit = 0;
+
+    // 1. Search 4-byte hash chain for matches of length >= 4.
+    if (pos + 4 <= size) {
+        int cand = head4[hash4(data + pos)];
+        int tries = max_effort;
+        while (cand >= 0 && tries-- > 0) {
+            if (cand < limit) break;
+            if (best.len >= 4 &&
+                (data[cand + best.len] != data[pos + best.len] ||
+                 data[cand + best.len - 1] != data[pos + best.len - 1])) {
+                cand = prev4[static_cast<std::size_t>(cand) & (kWindow - 1)];
+                continue;
+            }
+            int l = match_len_fast(data + cand, data + pos, maxl);
+            if (l >= 4 && l > best.len) {
+                best.len = l;
+                best.dist = static_cast<int>(pos) - cand;
+                if (l >= maxl) return best;
+            }
+            cand = prev4[static_cast<std::size_t>(cand) & (kWindow - 1)];
+        }
+    }
+
+    // 2. If no 4+ byte match was found, check 3-byte hash chain for the
+    // closest 3-byte match (rejecting distant length-3 matches > 4096).
+    if (best.len < 4) {
+        int cand = head3[hash3(data + pos)];
+        int tries = std::min(max_effort, 16);
+        while (cand >= 0 && tries-- > 0) {
+            if (cand < limit) break;
+            int d = static_cast<int>(pos) - cand;
+            if (d > 4096) break;
+            int l = match_len_fast(data + cand, data + pos, maxl);
+            if (l >= kMinMatch) {
+                best.len = l;
+                best.dist = d;
+                break;
+            }
+            cand = prev3[static_cast<std::size_t>(cand) & (kWindow - 1)];
+        }
+    }
+    return best;
+}
+
 // --------------------------------------------------------------------------
 // Token stream: a sequence of literals and (length, distance) pairs.
 // --------------------------------------------------------------------------
@@ -380,8 +418,6 @@ struct Token {
     int dist;               // if is_match (1..32768)
 };
 
-// LZ77 + lazy matching. Returns the token list and populates the literal/
-// length and distance frequency tables.
 // Forward declarations of the length/distance symbol lookups (defined
 // below); used by lz77_encode to update frequency tables.
 auto length_to_symbol(int len) -> int;
@@ -397,14 +433,21 @@ auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
     lit_freq.fill(0);
     dist_freq.fill(0);
 
-    std::vector<int> head(kHashSize, -1);
-    std::vector<int> prev(kWindow, -1);
+    std::vector<int> head3(kHashSize, -1);
+    std::vector<int> prev3(kWindow, -1);
+    std::vector<int> head4(kHashSize, -1);
+    std::vector<int> prev4(kWindow, -1);
 
     const auto* full_data = data - hist;
     const std::size_t full_size = size + hist;
 
+    auto insert_both = [&](std::size_t p) {
+        insert_hash(full_data, full_size, p, head3, prev3);
+        insert_hash4(full_data, full_size, p, head4, prev4);
+    };
+
     for (std::size_t i = 0; i < hist; ++i) {
-        insert_hash(full_data, full_size, i, head, prev);
+        insert_both(i);
     }
 
     // Level tuning: chain effort and lazy depth.
@@ -436,45 +479,46 @@ auto lz77_encode(const std::uint8_t* data, std::size_t size, int level,
 
     std::size_t pos = hist;
     while (pos < full_size) {
-        Match m = find_match(full_data, full_size, pos, head, prev, effort);
+        Match m =
+            find_match(full_data, full_size, pos, head3, prev3, head4, prev4, effort);
         if (m.len < kMinMatch) {
             emit_lit(full_data[pos]);
-            insert_hash(full_data, full_size, pos, head, prev);
+            insert_both(pos);
             ++pos;
             continue;
         }
 
-        if (lazy) {
-            // Insert pos, then look one byte ahead for a longer match. If the
-            // next position yields a longer match, emit a literal here and take
-            // that match instead (classic lazy matching, deflate_slow-style).
-            insert_hash(full_data, full_size, pos, head, prev);
-            Match m2 = find_match(full_data, full_size, pos + 1, head, prev, effort);
-            if (m2.len > m.len) {
+        if (lazy && pos + 1 < full_size) {
+            insert_both(pos);
+            Match m2 = find_match(full_data, full_size, pos + 1, head3, prev3,
+                                  head4, prev4, effort);
+            const bool better =
+                (m2.len > m.len + (m2.dist > m.dist * 8 ? 1 : 0)) ||
+                (m2.len == m.len && m2.dist * 8 < m.dist);
+            if (better) {
                 emit_lit(full_data[pos]);
                 ++pos;
                 m = m2;
                 emit_match(m.len, m.dist);
                 for (int i = 0; i < m.len; ++i) {
-                    insert_hash(full_data, full_size, pos + i, head, prev);
+                    insert_both(pos + static_cast<std::size_t>(i));
                 }
-                pos += m.len;
+                pos += static_cast<std::size_t>(m.len);
                 continue;
             }
-            // Keep the match at pos; pos was already inserted above.
             emit_match(m.len, m.dist);
             for (int i = 1; i < m.len; ++i) {
-                insert_hash(full_data, full_size, pos + i, head, prev);
+                insert_both(pos + static_cast<std::size_t>(i));
             }
-            pos += m.len;
+            pos += static_cast<std::size_t>(m.len);
             continue;
         }
 
         emit_match(m.len, m.dist);
         for (int i = 0; i < m.len; ++i) {
-            insert_hash(full_data, full_size, pos + i, head, prev);
+            insert_both(pos + static_cast<std::size_t>(i));
         }
-        pos += m.len;
+        pos += static_cast<std::size_t>(m.len);
     }
     // End-of-block symbol (256) frequency = 1.
     lit_freq[256]++;
@@ -534,6 +578,13 @@ inline auto init_dist_table() {
 const auto kLenTable = init_len_table();
 const auto kDistTable = init_dist_table();
 
+constexpr int kLenExtraBySym[29] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
+    2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+constexpr int kDistExtraBySym[30] = {
+    0, 0, 0, 0, 1, 1, 2,  2,  3,  3,  4,  4,  5,  5,  6,
+    6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
 inline auto length_code(int len) -> LenCode {
     return kLenTable[static_cast<std::size_t>(len)];
 }
@@ -550,6 +601,138 @@ inline auto distance_to_symbol(int dist) -> int {
     return kDistTable[static_cast<std::size_t>(dist)].sym;
 }
 
+// Build the RLE-encoded code-length sequence (codes 0..18) for a concatenated
+// literal/length + distance code-length array, avoiding 1- or 2-element
+// leftovers after a max-length repeat (codes 16 and 18).
+struct ClRle { int code; int xbits; };
+
+auto build_cl_rle(const std::array<int, 286>& lit_lens, int hlit,
+                  const std::array<int, 30>& dist_lens, int hdist,
+                  std::array<std::uint32_t, 19>& cl_freq)
+    -> std::vector<ClRle> {
+    std::vector<int> all_lens;
+    all_lens.reserve(static_cast<std::size_t>(hlit + hdist));
+    for (int i = 0; i < hlit; ++i) all_lens.push_back(lit_lens[static_cast<std::size_t>(i)]);
+    for (int i = 0; i < hdist; ++i) all_lens.push_back(dist_lens[static_cast<std::size_t>(i)]);
+
+    std::vector<ClRle> rle;
+    rle.reserve(all_lens.size());
+    cl_freq.fill(0);
+    for (std::size_t i = 0; i < all_lens.size();) {
+        int v = all_lens[i];
+        int run = 1;
+        while (i + static_cast<std::size_t>(run) < all_lens.size() &&
+               all_lens[i + static_cast<std::size_t>(run)] == v) {
+            ++run;
+        }
+
+        if (v == 0) {
+            int emitted = 0;
+            while (emitted < run) {
+                int rem = run - emitted;
+                if (rem >= 11) {
+                    int r = std::min(rem, 138);
+                    if (rem > 138 && rem - 138 < 3) {
+                        r = rem - 3;
+                    }
+                    rle.push_back({18, r - 11});
+                    cl_freq[18]++;
+                    emitted += r;
+                } else if (rem >= 3) {
+                    int r = std::min(rem, 10);
+                    rle.push_back({17, r - 3});
+                    cl_freq[17]++;
+                    emitted += r;
+                } else {
+                    rle.push_back({0, 0});
+                    cl_freq[0]++;
+                    emitted++;
+                }
+            }
+        } else {
+            rle.push_back({v, 0});
+            cl_freq[static_cast<std::size_t>(v)]++;
+            int emitted = 1;
+            while (emitted < run) {
+                int rem = run - emitted;
+                if (rem >= 3) {
+                    int r = std::min(rem, 6);
+                    if (rem > 6 && rem - 6 < 3) {
+                        r = rem - 3;
+                    }
+                    rle.push_back({16, r - 3});
+                    cl_freq[16]++;
+                    emitted += r;
+                } else {
+                    rle.push_back({v, 0});
+                    cl_freq[static_cast<std::size_t>(v)]++;
+                    emitted++;
+                }
+            }
+        }
+        i += static_cast<std::size_t>(run);
+    }
+    return rle;
+}
+
+// Compute the exact bit length of a dynamic Huffman block from its symbol
+// frequencies alone in O(alphabet) time (header + all tokens + EOB).
+auto dynamic_block_bits(const std::array<std::uint32_t, 288>& lit_freq,
+                        const std::array<std::uint32_t, 32>& dist_freq)
+    -> std::size_t {
+    auto lit_lens_full = build_huff_lengths(lit_freq, 286, 15);
+    std::array<std::uint32_t, 32> df{};
+    for (int i = 0; i < 30; ++i) df[static_cast<std::size_t>(i)] = dist_freq[static_cast<std::size_t>(i)];
+    auto dist_lens_full = build_huff_lengths(df, 30, 15);
+
+    std::array<int, 286> lit_lens{};
+    for (int i = 0; i < 286; ++i) lit_lens[static_cast<std::size_t>(i)] = lit_lens_full[static_cast<std::size_t>(i)];
+    std::array<int, 30> dist_lens{};
+    for (int i = 0; i < 30; ++i) dist_lens[static_cast<std::size_t>(i)] = dist_lens_full[static_cast<std::size_t>(i)];
+
+    int hlit = 286;
+    while (hlit > 257 && lit_lens[static_cast<std::size_t>(hlit - 1)] == 0) --hlit;
+    int hdist = 30;
+    while (hdist > 1 && dist_lens[static_cast<std::size_t>(hdist - 1)] == 0) --hdist;
+
+    std::array<std::uint32_t, 19> cl_freq{};
+    auto rle = build_cl_rle(lit_lens, hlit, dist_lens, hdist, cl_freq);
+    auto cl_lens = build_huff_lengths(cl_freq, 19, 7);
+
+    static const int order[19] = {16, 17, 18, 0, 8,  7, 9,  6, 10, 5,
+                                  11, 4,  12, 3, 13, 2, 14, 1, 15};
+    int hclen = 19;
+    while (hclen > 4 && cl_lens[static_cast<std::size_t>(order[hclen - 1])] == 0) --hclen;
+
+    std::size_t bits = 3 + 5 + 5 + 4 + static_cast<std::size_t>(hclen) * 3;
+    for (int s = 0; s < 19; ++s) {
+        if (cl_freq[static_cast<std::size_t>(s)] > 0) {
+            int extra = (s == 16) ? 2 : (s == 17) ? 3 : (s == 18) ? 7 : 0;
+            bits += static_cast<std::size_t>(cl_freq[static_cast<std::size_t>(s)]) *
+                    static_cast<std::size_t>(cl_lens[static_cast<std::size_t>(s)] + extra);
+        }
+    }
+    for (int s = 0; s <= 256; ++s) {
+        bits += static_cast<std::size_t>(lit_freq[static_cast<std::size_t>(s)]) *
+                static_cast<std::size_t>(lit_lens[static_cast<std::size_t>(s)]);
+    }
+    for (int s = 257; s < 286; ++s) {
+        if (lit_freq[static_cast<std::size_t>(s)] > 0) {
+            bits += static_cast<std::size_t>(lit_freq[static_cast<std::size_t>(s)]) *
+                    static_cast<std::size_t>(lit_lens[static_cast<std::size_t>(s)] +
+                                             kLenExtraBySym[s - 257]);
+        }
+    }
+    for (int d = 0; d < 30; ++d) {
+        if (dist_freq[static_cast<std::size_t>(d)] > 0) {
+            bits += static_cast<std::size_t>(dist_freq[static_cast<std::size_t>(d)]) *
+                    static_cast<std::size_t>(dist_lens[static_cast<std::size_t>(d)] +
+                                             kDistExtraBySym[d]);
+        }
+    }
+    return bits;
+}
+
 // One candidate match for the optimal parser.
 struct MatchCand {
     int len;
@@ -558,13 +741,11 @@ struct MatchCand {
 
 // Maximum Pareto candidates kept per position: closer matches (cheaper
 // distance codes) versus longer matches.
-constexpr int kMaxCands = 16;
+constexpr int kMaxCands = 32;
 
 // Collect Pareto-optimal matches at `pos` into `out` (capacity kMaxCands):
 // matches for which no other match is both at least as long and at least as
-// close. `out` ends up sorted by increasing distance (and length). Two hash
-// chains (3-byte and 4-byte prefixes) are searched; the 4-byte chain finds
-// long matches quickly while the 3-byte chain covers length-3 matches.
+// close. `out` ends up sorted by increasing distance (and length).
 auto find_match_candidates(const std::uint8_t* data, std::size_t size,
                            std::size_t pos, const std::vector<int>& head3,
                            const std::vector<int>& prev3,
@@ -579,23 +760,22 @@ auto find_match_candidates(const std::uint8_t* data, std::size_t size,
     int best_len = 0;
 
     // Update the Pareto set with a candidate at absolute position `cand`.
-    // Returns false if the candidate is out of window (caller should stop).
-    auto consider = [&](int cand) -> bool {
+    // Returns false if the candidate is out of window or hits maxl.
+    auto consider = [&](int cand, int min_req) -> bool {
         if (cand < limit) return false;
         const int d = static_cast<int>(pos) - cand;
 
         // Quick rejection: if distance is larger than all existing candidates,
         // this candidate must beat best_len to be non-dominated.
-        if (n > 0 && d >= out[n - 1].dist && best_len >= kMinMatch) {
+        if (n > 0 && d >= out[n - 1].dist && best_len >= min_req) {
             if (best_len >= maxl) return false;
             if (data[cand + best_len] != data[pos + best_len]) {
                 return true;  // Can't beat best_len, but older candidates might
             }
         }
 
-        int l = 0;
-        while (l < maxl && data[cand + l] == data[pos + l]) ++l;
-        if (l >= kMinMatch) {
+        const int l = match_len_fast(data + cand, data + pos, maxl);
+        if (l >= min_req) {
             if (l > best_len) best_len = l;
             bool dominated = false;
             for (int j = 0; j < n; ++j) {
@@ -627,22 +807,26 @@ auto find_match_candidates(const std::uint8_t* data, std::size_t size,
         return true;
     };
 
-    // 4-byte chain first (longer matches).
+    // 1. Search 3-byte chain first for the closest length-3+ match. Every
+    // match of length >= 4 is in `head4`, so only the closest valid 3-byte
+    // match from `head3` can be Pareto-optimal.
     {
+        int cand = head3[hash3(data + pos)];
+        int tries = 8;
+        while (cand >= 0 && tries-- > 0) {
+            if (cand < limit) break;
+            int prev_n = n;
+            if (!consider(cand, kMinMatch) || n > prev_n) break;
+            cand = prev3[static_cast<std::size_t>(cand) & (kWindow - 1)];
+        }
+    }
+    // 2. Search 4-byte chain for all longer Pareto-optimal matches.
+    if (pos + 4 <= size) {
         int cand = head4[hash4(data + pos)];
         int tries = effort;
         while (cand >= 0 && tries-- > 0) {
-            if (!consider(cand)) break;
+            if (!consider(cand, 4)) break;
             cand = prev4[static_cast<std::size_t>(cand) & (kWindow - 1)];
-        }
-    }
-    // 3-byte chain.
-    {
-        int cand = head3[hash3(data + pos)];
-        int tries = effort;
-        while (cand >= 0 && tries-- > 0) {
-            if (!consider(cand)) break;
-            cand = prev3[static_cast<std::size_t>(cand) & (kWindow - 1)];
         }
     }
     return n;
@@ -650,10 +834,11 @@ auto find_match_candidates(const std::uint8_t* data, std::size_t size,
 
 // --------------------------------------------------------------------------
 // Optimal (shortest-path) LZ77 parse with iterative Huffman cost feedback.
-// A forward pass records the longest match at every position; a backward DP
-// then picks the cheapest token sequence. Symbol costs come from the Huffman
-// code lengths rebuilt from the previous parse, repeated `iterations` times
-// (Zopfli-style). Levels that use this pay a large time cost for ratio.
+// A forward pass records Pareto-optimal matches at every position; a backward
+// DP then picks the cheapest token sequence. Symbol costs come from the
+// Huffman code lengths rebuilt from the previous parse, repeated `iterations`
+// times (Zopfli-style), keeping the iteration with the minimum actual dynamic
+// block bit count.
 // --------------------------------------------------------------------------
 auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
                   int iterations, std::array<std::uint32_t, 288>& lit_freq,
@@ -674,7 +859,7 @@ auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
     // Forward pass: Pareto-optimal matches at every position, stored in a
     // shared pool indexed by `cand_start`.
     std::vector<MatchCand> pool;
-    pool.reserve(static_cast<std::size_t>(N));
+    pool.reserve(static_cast<std::size_t>(N) * 2);
     std::vector<int> cand_start(static_cast<std::size_t>(N) + 1, 0);
     {
         std::vector<int> head3(kHashSize, -1);
@@ -709,9 +894,14 @@ auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
         const int start_ci = cand_start[static_cast<std::size_t>(p)];
         if (end_ci > start_ci) {
             const MatchCand& best = pool[static_cast<std::size_t>(end_ci - 1)];
-            lit_freq[257 + length_to_symbol(best.len)]++;
-            dist_freq[distance_to_symbol(best.dist)]++;
-            p += best.len;
+            if (best.len == 3 && best.dist > 4096) {
+                lit_freq[data[p]]++;
+                ++p;
+            } else {
+                lit_freq[257 + length_to_symbol(best.len)]++;
+                dist_freq[distance_to_symbol(best.dist)]++;
+                p += best.len;
+            }
         } else {
             lit_freq[data[p]]++;
             ++p;
@@ -731,6 +921,11 @@ auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
     std::vector<int> choice_dist(static_cast<std::size_t>(N), 0);
     std::vector<double> dp(static_cast<std::size_t>(N) + 1, 0.0);
     std::vector<Token> tokens;
+
+    std::vector<Token> best_tokens;
+    std::array<std::uint32_t, 288> best_lit_freq{};
+    std::array<std::uint32_t, 32> best_dist_freq{};
+    std::size_t best_bits = static_cast<std::size_t>(-1);
 
     std::array<double, 256> lit_cost{};
     std::array<double, 259> len_cost{};
@@ -822,8 +1017,19 @@ auto lz77_optimal(const std::uint8_t* data, std::size_t size, int effort,
             }
         }
         lit_freq[256]++;
+
+        const std::size_t cur_bits = dynamic_block_bits(lit_freq, dist_freq);
+        if (cur_bits < best_bits) {
+            best_bits = cur_bits;
+            best_tokens = tokens;
+            best_lit_freq = lit_freq;
+            best_dist_freq = dist_freq;
+        }
     }
-    return tokens;
+
+    lit_freq = best_lit_freq;
+    dist_freq = best_dist_freq;
+    return best_tokens;
 }
 
 // --------------------------------------------------------------------------
@@ -862,9 +1068,8 @@ void emit_stored_blocks(BitWriter& w, bool final, const std::uint8_t* data,
     }
 }
 
-// Emit all tokens using fixed Huffman codes (BTYPE=01).
-void emit_fixed_block(BitWriter& w, bool final,
-                      const std::vector<Token>& tokens) {
+// Emit all tokens in `tokens` using fixed Huffman codes (BTYPE=01).
+void emit_fixed_block(BitWriter& w, bool final, std::span<const Token> tokens) {
     w.put_bits(final ? 1u : 0u, 1);
     w.put_bits(1u, 2);  // BTYPE = 01 (fixed Huffman)
 
@@ -915,112 +1120,52 @@ void emit_fixed_block(BitWriter& w, bool final,
     w.put_huff(lit.codes[256], lit.lengths[256]);
 }
 
-// Emit all tokens using dynamic Huffman codes (BTYPE=10).
+// Emit all tokens in `tokens` using dynamic Huffman codes (BTYPE=10).
 void emit_dynamic_block(BitWriter& w, bool final,
-                        const std::vector<Token>& tokens,
+                        std::span<const Token> tokens,
                         const std::array<std::uint32_t, 288>& lit_freq,
                         const std::array<std::uint32_t, 32>& dist_freq) {
     w.put_bits(final ? 1u : 0u, 1);
     w.put_bits(2u, 2);  // BTYPE = 10 (dynamic Huffman)
 
     // Build literal/length tree (286 symbols: 0..285; 286/287 unused).
-    auto lit_lens = build_huff_lengths(lit_freq, 286, 15);
-    auto lit = build_canonical_codes(lit_lens, 286);
+    auto lit_lens_full = build_huff_lengths(lit_freq, 286, 15);
+    auto lit = build_canonical_codes(lit_lens_full, 286);
 
     // Build distance tree (30 symbols: 0..29).
     std::array<std::uint32_t, 32> df{};
     for (int i = 0; i < 30; ++i) df[i] = dist_freq[i];
     auto dist_lens_full = build_huff_lengths(df, 30, 15);
-    std::array<int, 32> dist_lens{};
-    for (int i = 0; i < 30; ++i) dist_lens[i] = dist_lens_full[i];
-    auto dist = build_canonical_codes(dist_lens, 30);
+    auto dist = build_canonical_codes(dist_lens_full, 30);
+
+    std::array<int, 286> lit_lens{};
+    for (int i = 0; i < 286; ++i) lit_lens[static_cast<std::size_t>(i)] = lit_lens_full[static_cast<std::size_t>(i)];
+    std::array<int, 30> dist_lens{};
+    for (int i = 0; i < 30; ++i) dist_lens[static_cast<std::size_t>(i)] = dist_lens_full[static_cast<std::size_t>(i)];
 
     // Count HLIT/HDIST: number of literal/length and distance codes.
     int hlit = 286;
-    while (hlit > 257 && lit_lens[hlit - 1] == 0) --hlit;
+    while (hlit > 257 && lit_lens[static_cast<std::size_t>(hlit - 1)] == 0) --hlit;
     int hdist = 30;
-    while (hdist > 1 && dist_lens[hdist - 1] == 0) --hdist;
-    // HLIT/HDIST are encoded as (count - 257) / (count - 1) in 5 bits.
+    while (hdist > 1 && dist_lens[static_cast<std::size_t>(hdist - 1)] == 0) --hdist;
     w.put_bits(static_cast<std::uint32_t>(hlit - 257), 5);
     w.put_bits(static_cast<std::uint32_t>(hdist - 1), 5);
 
-    // Build the code-length code tree from the RLE'd sequence of lengths.
-    // Concatenate lit_lens[0..hlit) + dist_lens[0..hdist).
-    std::vector<int> all_lens;
-    all_lens.reserve(hlit + hdist);
-    for (int i = 0; i < hlit; ++i) all_lens.push_back(lit_lens[i]);
-    for (int i = 0; i < hdist; ++i) all_lens.push_back(dist_lens[i]);
-
-    // RLE-encode the length sequence using codes 0..18 (RFC 1951 §3.2.7).
-    // Codes: 0..15 = literal length value; 16 = repeat previous 3-6 times
-    // (2 extra bits); 17 = repeat zero 3-10 times (3 extra bits);
-    // 18 = repeat zero 11-138 times (7 extra bits).
-    struct Rle { int code; int xbits; };
-    std::vector<Rle> rle;
     std::array<std::uint32_t, 19> cl_freq{};
-    for (std::size_t i = 0; i < all_lens.size(); ) {
-        int v = all_lens[i];
-        int run = 1;
-        while (i + run < all_lens.size() && all_lens[i + run] == v) ++run;
-
-        if (v == 0) {
-            // Run of zeros: use 17 (3-10) or 18 (11-138), with individual
-            // 0-codes for any remainder < 3.
-            int emitted = 0;
-            while (emitted < run) {
-                int rem = run - emitted;
-                if (rem >= 11) {
-                    int r = std::min(rem, 138);
-                    rle.push_back({18, r - 11});
-                    cl_freq[18]++;
-                    emitted += r;
-                } else if (rem >= 3) {
-                    rle.push_back({17, rem - 3});
-                    cl_freq[17]++;
-                    emitted += rem;
-                } else {
-                    rle.push_back({0, 0});
-                    cl_freq[0]++;
-                    emitted++;
-                }
-            }
-        } else {
-            // Run of a non-zero value: emit it once, then use code 16 to
-            // repeat it 3-6 times (code 16 repeats the *previous* code).
-            rle.push_back({v, 0});
-            cl_freq[v]++;
-            int emitted = 1;
-            while (emitted < run) {
-                int rem = run - emitted;
-                if (rem >= 3) {
-                    int r = std::min(rem, 6);
-                    rle.push_back({16, r - 3});
-                    cl_freq[16]++;
-                    emitted += r;
-                } else {
-                    rle.push_back({v, 0});
-                    cl_freq[v]++;
-                    emitted++;
-                }
-            }
-        }
-        i += run;
-    }
+    auto rle = build_cl_rle(lit_lens, hlit, dist_lens, hdist, cl_freq);
 
     // Build the code-length code tree (19 symbols, max 7 bits).
-    std::array<std::uint32_t, 19> clf{};
-    for (int i = 0; i < 19; ++i) clf[i] = cl_freq[i];
-    auto cl_lens = build_huff_lengths(clf, 19, 7);
+    auto cl_lens = build_huff_lengths(cl_freq, 19, 7);
     auto cl = build_canonical_codes(cl_lens, 19);
 
     // HCLEN: number of code-length codes (4..19), in the magic order.
     static const int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5,
-                                   11, 4, 12, 3, 13, 2, 14, 1, 15};
+                                  11, 4, 12, 3, 13, 2, 14, 1, 15};
     int hclen = 19;
-    while (hclen > 4 && cl_lens[order[hclen - 1]] == 0) --hclen;
+    while (hclen > 4 && cl_lens[static_cast<std::size_t>(order[hclen - 1])] == 0) --hclen;
     w.put_bits(static_cast<std::uint32_t>(hclen - 4), 4);
     for (int i = 0; i < hclen; ++i) {
-        w.put_bits(static_cast<std::uint32_t>(cl_lens[order[i]]), 3);
+        w.put_bits(static_cast<std::uint32_t>(cl_lens[static_cast<std::size_t>(order[i])]), 3);
     }
 
     // Emit the RLE'd code lengths using the code-length tree.
@@ -1058,9 +1203,127 @@ void emit_dynamic_block(BitWriter& w, bool final,
     w.put_huff(lit.codes[256], lit.lengths[256]);
 }
 
-// Block size: 256 KiB gives better Huffman tree adaptation for mixed data
-// while maintaining low header overhead and thread-level parallelism.
-constexpr std::size_t kBlockSize = 256 * 1024;  // 256 KiB per block
+// Emit one token sub-block `[tok_begin, tok_end)` corresponding to raw bytes
+// `[raw_data, raw_data + raw_len)`, choosing the smallest of dynamic, fixed,
+// or stored block encodings.
+void emit_best_subblock(BitWriter& w, bool final,
+                        std::span<const Token> tokens,
+                        const std::array<std::uint32_t, 288>& lit_freq,
+                        const std::array<std::uint32_t, 32>& dist_freq,
+                        const std::uint8_t* raw_data, std::size_t raw_len,
+                        int level) {
+    const std::size_t base_bits = w.total_bits();
+    const auto base = w.mark();
+    int best_mode = 1;  // 0 = dynamic, 1 = fixed, 2 = stored
+    std::size_t best_bits = static_cast<std::size_t>(-1);
+
+    if (level >= 4) {
+        emit_dynamic_block(w, final, tokens, lit_freq, dist_freq);
+        best_bits = w.total_bits() - base_bits;
+        best_mode = 0;
+        w.restore(base);
+    }
+
+    emit_fixed_block(w, final, tokens);
+    if (w.total_bits() - base_bits < best_bits) {
+        best_bits = w.total_bits() - base_bits;
+        best_mode = 1;
+    }
+    w.restore(base);
+
+    emit_stored_blocks(w, final, raw_data, raw_len);
+    if (w.total_bits() - base_bits < best_bits) {
+        best_bits = w.total_bits() - base_bits;
+        best_mode = 2;
+    }
+    w.restore(base);
+
+    switch (best_mode) {
+        case 0:
+            emit_dynamic_block(w, final, tokens, lit_freq, dist_freq);
+            break;
+        case 1:
+            emit_fixed_block(w, final, tokens);
+            break;
+        default:
+            emit_stored_blocks(w, final, raw_data, raw_len);
+            break;
+    }
+}
+
+// Recursively partition `tokens[a..b)` into variable-sized DEFLATE blocks when
+// separate dynamic Huffman trees reduce total bits (including tree headers).
+void find_block_splits(std::span<const Token> tokens, std::size_t a,
+                       std::size_t b, std::vector<std::size_t>& splits) {
+    constexpr std::size_t kMinSplitTokens = 1024;
+    constexpr int kChunks = 16;
+    const std::size_t n = b - a;
+    if (n < kMinSplitTokens * 2) return;
+
+    std::array<std::array<std::uint32_t, 288>, kChunks + 1> pref_lit{};
+    std::array<std::array<std::uint32_t, 32>, kChunks + 1> pref_dist{};
+
+    for (int k = 0; k < kChunks; ++k) {
+        pref_lit[static_cast<std::size_t>(k + 1)] = pref_lit[static_cast<std::size_t>(k)];
+        pref_dist[static_cast<std::size_t>(k + 1)] = pref_dist[static_cast<std::size_t>(k)];
+        const std::size_t start = a + (n * static_cast<std::size_t>(k)) / kChunks;
+        const std::size_t end = a + (n * static_cast<std::size_t>(k + 1)) / kChunks;
+        auto& lf = pref_lit[static_cast<std::size_t>(k + 1)];
+        auto& df = pref_dist[static_cast<std::size_t>(k + 1)];
+        for (std::size_t i = start; i < end; ++i) {
+            const Token& t = tokens[i];
+            if (!t.is_match) {
+                lf[t.lit]++;
+            } else {
+                lf[static_cast<std::size_t>(257 + length_to_symbol(t.len))]++;
+                df[static_cast<std::size_t>(distance_to_symbol(t.dist))]++;
+            }
+        }
+    }
+
+    auto whole_lit = pref_lit[kChunks];
+    whole_lit[256] = 1;
+    const std::size_t whole_bits =
+        dynamic_block_bits(whole_lit, pref_dist[kChunks]);
+
+    std::size_t best_bits = whole_bits;
+    int best_k = -1;
+    for (int k = 1; k < kChunks; ++k) {
+        const std::size_t split_pos = a + (n * static_cast<std::size_t>(k)) / kChunks;
+        if (split_pos - a < kMinSplitTokens || b - split_pos < kMinSplitTokens) {
+            continue;
+        }
+        auto left_lit = pref_lit[static_cast<std::size_t>(k)];
+        left_lit[256] = 1;
+        std::array<std::uint32_t, 288> right_lit{};
+        std::array<std::uint32_t, 32> right_dist{};
+        for (std::size_t s = 0; s < 286; ++s) {
+            right_lit[s] = pref_lit[kChunks][s] - left_lit[s];
+        }
+        right_lit[256] = 1;
+        for (std::size_t d = 0; d < 30; ++d) {
+            right_dist[d] = pref_dist[kChunks][d] - pref_dist[static_cast<std::size_t>(k)][d];
+        }
+        const std::size_t cand_bits =
+            dynamic_block_bits(left_lit, pref_dist[static_cast<std::size_t>(k)]) +
+            dynamic_block_bits(right_lit, right_dist);
+        if (cand_bits + 16 < best_bits) {
+            best_bits = cand_bits;
+            best_k = k;
+        }
+    }
+
+    if (best_k > 0) {
+        const std::size_t mid = a + (n * static_cast<std::size_t>(best_k)) / kChunks;
+        find_block_splits(tokens, a, mid, splits);
+        splits.push_back(mid);
+        find_block_splits(tokens, mid, b, splits);
+    }
+}
+
+// Block size: 256 KiB gives cross-block parallelism while adaptive block
+// splitting partitions heterogeneous regions into optimal dynamic Huffman blocks.
+constexpr std::size_t kBlockSize = 256 * 1024;  // 256 KiB per wave block
 
 }  // namespace
 
@@ -1083,11 +1346,11 @@ auto deflate_compress(std::span<const std::byte> data, int level)
     // Huffman-cost refinement iterations (and match-finder effort).
     const bool use_optimal = (level >= 9);
     int opt_effort = 1024;
-    int opt_iterations = 2;
+    int opt_iterations = 3;
     switch (level) {
-        case 10: opt_effort = 2048; opt_iterations = 3; break;
-        case 11: opt_effort = 4096; opt_iterations = 4; break;
-        case 12: opt_effort = 8192; opt_iterations = 6; break;
+        case 10: opt_effort = 2048; opt_iterations = 4; break;
+        case 11: opt_effort = 4096; opt_iterations = 5; break;
+        case 12: opt_effort = 8192; opt_iterations = 7; break;
         default: break;
     }
 
@@ -1160,47 +1423,46 @@ auto deflate_compress(std::span<const std::byte> data, int level)
 
         for (const BlockJob& job : wave) {
             const auto* block_data = p + job.off;
-            const std::size_t base_bits = w.total_bits();
-            const auto base = w.mark();
-            int best_mode = 1;  // 0 = dynamic, 1 = fixed, 2 = stored
-            std::size_t best_bits = static_cast<std::size_t>(-1);
+            std::span<const Token> all_toks{job.tokens.data(), job.tokens.size()};
 
-            // Try dynamic Huffman (worth it from level 4 up).
-            if (level >= 4) {
-                emit_dynamic_block(w, job.final, job.tokens, job.lit_freq,
-                                   job.dist_freq);
-                best_bits = w.total_bits() - base_bits;
-                best_mode = 0;
-                w.restore(base);
+            // At levels >= 6, check if partitioning the token stream into
+            // multiple dynamic Huffman sub-blocks reduces total bits.
+            std::vector<std::size_t> bounds;
+            bounds.push_back(0);
+            if (level >= 6 && all_toks.size() >= 2048) {
+                find_block_splits(all_toks, 0, all_toks.size(), bounds);
             }
+            bounds.push_back(all_toks.size());
 
-            // Try fixed Huffman.
-            emit_fixed_block(w, job.final, job.tokens);
-            if (w.total_bits() - base_bits < best_bits) {
-                best_bits = w.total_bits() - base_bits;
-                best_mode = 1;
-            }
-            w.restore(base);
-
-            // Try stored (never expands beyond a small header).
-            emit_stored_blocks(w, job.final, block_data, job.len);
-            if (w.total_bits() - base_bits < best_bits) {
-                best_bits = w.total_bits() - base_bits;
-                best_mode = 2;
-            }
-            w.restore(base);
-
-            switch (best_mode) {
-                case 0:
-                    emit_dynamic_block(w, job.final, job.tokens, job.lit_freq,
-                                       job.dist_freq);
-                    break;
-                case 1:
-                    emit_fixed_block(w, job.final, job.tokens);
-                    break;
-                default:
-                    emit_stored_blocks(w, job.final, block_data, job.len);
-                    break;
+            if (bounds.size() <= 2) {
+                emit_best_subblock(w, job.final, all_toks, job.lit_freq,
+                                   job.dist_freq, block_data, job.len, level);
+            } else {
+                std::size_t byte_cursor = 0;
+                for (std::size_t bi = 0; bi + 1 < bounds.size(); ++bi) {
+                    const std::size_t t0 = bounds[bi];
+                    const std::size_t t1 = bounds[bi + 1];
+                    const bool sub_final = job.final && (bi + 2 == bounds.size());
+                    std::array<std::uint32_t, 288> sub_lit{};
+                    std::array<std::uint32_t, 32> sub_dist{};
+                    std::size_t sub_bytes = 0;
+                    for (std::size_t ti = t0; ti < t1; ++ti) {
+                        const Token& t = all_toks[ti];
+                        if (!t.is_match) {
+                            sub_lit[t.lit]++;
+                            sub_bytes += 1;
+                        } else {
+                            sub_lit[static_cast<std::size_t>(257 + length_to_symbol(t.len))]++;
+                            sub_dist[static_cast<std::size_t>(distance_to_symbol(t.dist))]++;
+                            sub_bytes += static_cast<std::size_t>(t.len);
+                        }
+                    }
+                    sub_lit[256] = 1;
+                    emit_best_subblock(w, sub_final, all_toks.subspan(t0, t1 - t0),
+                                       sub_lit, sub_dist,
+                                       block_data + byte_cursor, sub_bytes, level);
+                    byte_cursor += sub_bytes;
+                }
             }
         }
     }

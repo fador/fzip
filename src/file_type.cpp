@@ -102,15 +102,19 @@ auto detect_file_type(std::string_view path,
         return FileType::Incompressible;
     }
 
-    // Check extension-based incompressible types.
+    // Check extension-based incompressible types. Only formats whose payload
+    // is (almost) always entropy-coded belong here. Uncompressed containers
+    // (.tar, .bmp, .tga, .ico, .wav), sfnt fonts (.ttf, .otf, .eot) and
+    // .pdf/.ps routinely shrink 20-80 %, so they go through the trial pass;
+    // Store remains the floor if they don't compress.
     auto ext = extension_of(path);
     static const char* incomp_exts[] = {
-        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".ico", ".tga",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp",
         ".mp3", ".mp4", ".m4a", ".m4v", ".avi", ".mkv", ".mov", ".wmv",
-        ".flv", ".ogg", ".opus", ".flac", ".wav", ".aac",
-        ".zip", ".gz", ".xz", ".zst", ".bz2", ".rar", ".7z", ".tar",
+        ".flv", ".ogg", ".opus", ".flac", ".aac",
+        ".zip", ".gz", ".xz", ".zst", ".bz2", ".rar", ".7z",
         ".jar", ".apk", ".docx", ".xlsx", ".pptx", ".odt", ".epub",
-        ".pdf", ".ps", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+        ".woff", ".woff2",
     };
     for (auto* e : incomp_exts) {
         if (ext == e) return FileType::Incompressible;

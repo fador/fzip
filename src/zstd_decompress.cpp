@@ -291,10 +291,17 @@ struct ResolvedSeqTable {
     int acc = 0;
 };
 
-// Parse one stream's table (predefined / RLE / inline FSE), advancing `p`.
+// Parse one stream's table (predefined / RLE / inline FSE / repeat), advancing `p`.
 void build_seq_table(int mode, int kind, const std::byte*& p,
                      const std::byte* end, ResolvedSeqTable& out) {
+    if (mode == 3) {  // repeat previous compressed block's table
+        if (out.table == nullptr) {
+            throw ZstdError("repeat sequence FSE table without previous table");
+        }
+        return;
+    }
     if (mode == 0) {  // predefined
+        out.storage.clear();
         if (kind == 0) {
             out.table = kLLDefaultDTable;
             out.acc = 6;
@@ -348,7 +355,9 @@ void build_seq_table(int mode, int kind, const std::byte*& p,
 // across compressed blocks).
 void decompress_compressed_block(const std::byte* data, std::size_t size,
                                  std::vector<std::byte>& out,
-                                 RepeatOffsets& repeat, HufTable& prev_huf) {
+                                 RepeatOffsets& repeat, HufTable& prev_huf,
+                                 ResolvedSeqTable& ll, ResolvedSeqTable& of,
+                                 ResolvedSeqTable& ml) {
     // Compressed block format:
     //   1. Literals section (variable size)
     //   2. Sequences section
@@ -381,8 +390,7 @@ void decompress_compressed_block(const std::byte* data, std::size_t size,
     int of_mode = (modes >> 4) & 3;
     int ml_mode = (modes >> 2) & 3;
 
-    // Resolve each stream's FSE table (predefined / RLE / inline).
-    ResolvedSeqTable ll, of, ml;
+    // Resolve each stream's FSE table (predefined / RLE / inline / repeat).
     build_seq_table(ll_mode, 0, p, end, ll);
     build_seq_table(of_mode, 1, p, end, of);
     build_seq_table(ml_mode, 2, p, end, ml);
@@ -399,7 +407,9 @@ void decompress_compressed_block(const std::byte* data, std::size_t size,
 // Decompress one block (handles all block types), appending to `out`.
 void decompress_block(const std::byte* data, std::size_t size,
                       const BlockHeader& hdr, std::vector<std::byte>& out,
-                      RepeatOffsets& repeat, HufTable& prev_huf) {
+                      RepeatOffsets& repeat, HufTable& prev_huf,
+                      ResolvedSeqTable& ll, ResolvedSeqTable& of,
+                      ResolvedSeqTable& ml) {
     switch (hdr.type) {
         case BlockType::Raw:
             if (size < hdr.block_size) throw ZstdError("raw block truncated");
@@ -410,7 +420,8 @@ void decompress_block(const std::byte* data, std::size_t size,
             out.insert(out.end(), hdr.block_size, data[0]);
             break;
         case BlockType::Compressed:
-            decompress_compressed_block(data, size, out, repeat, prev_huf);
+            decompress_compressed_block(data, size, out, repeat, prev_huf, ll,
+                                        of, ml);
             break;
         default:
             throw ZstdError("reserved block type");
@@ -456,6 +467,7 @@ auto decompress(std::span<const std::byte> data, std::size_t) -> std::vector<std
     }
     RepeatOffsets repeat;
     HufTable prev_huf;  // reused by Treeless_Literals_Blocks
+    ResolvedSeqTable prev_ll, prev_of, prev_ml;
     bool last = false;
     while (!last && p < end) {
         BlockHeader blk;
@@ -474,7 +486,7 @@ auto decompress(std::span<const std::byte> data, std::size_t) -> std::vector<std
             (blk.type == BlockType::RLE) ? 1 : blk.block_size;
         const std::size_t avail = static_cast<std::size_t>(end - p);
         decompress_block(p, std::min(content_len, avail), blk, output, repeat,
-                         prev_huf);
+                         prev_huf, prev_ll, prev_of, prev_ml);
         p += content_len;
     }
 

@@ -85,8 +85,14 @@ auto compress_auto(std::span<const std::byte> data,
         }
     };
 
-    consider(compress_with(CodecId::Deflate, data, 9, hint_path));
-    consider(compress_with(CodecId::Zstd, data, level, hint_path));
+    // Deflate-12 runs a deeper optimal parse; its cost is negligible on
+    // small/medium entries, where deflate usually beats zstd anyway, so it
+    // replaces level 9 there. Large entries keep level 9 to bound time.
+    constexpr std::size_t kDeflate12Limit = 1u << 20;  // 1 MiB
+    const int deflate_level = (data.size() <= kDeflate12Limit) ? 12 : 9;
+    const int zstd_level = (level >= 19 && data.size() <= kDeflate12Limit) ? 22 : level;
+    consider(compress_with(CodecId::Deflate, data, deflate_level, hint_path));
+    consider(compress_with(CodecId::Zstd, data, zstd_level, hint_path));
 
     return best;
 }

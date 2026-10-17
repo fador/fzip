@@ -47,6 +47,9 @@ constexpr std::uint16_t kExtraUnix  = 0x7875u;  // "ux" Unix UID/GID
 
 // Data alignment target: entry data starts at a multiple of this many bytes.
 // 4096 matches the page size and Android APK zipalign v2 requirements.
+// Like zipalign, only *stored* entries are aligned: they are the only ones
+// that can be mmapped and used in place. Padding compressed entries buys
+// nothing and costs ~2 KB per entry on average.
 constexpr std::uint64_t kDataAlignment = 4096;
 
 // Decide whether an entry requires ZIP64 based on its (un)compressed size.
@@ -113,6 +116,53 @@ class ExtraFields {
     std::ostringstream buf_;
 };
 
+// Append the UT (Unix timestamp) and, when meaningful, the "ux" (UID/GID)
+// extra fields. Shared by local and central headers.
+//
+// UT: 1 byte flags + optional mtime/atime/ctime (u32 each); flags bit 0 =
+// mtime, bit 1 = atime, bit 2 = ctime. atime/ctime are only written when
+// they differ from mtime (they are usually copies), saving 8 bytes per
+// header. The central-directory UT may only carry mtime per the Info-ZIP
+// spec, while its flags mirror the local header.
+void add_ut_unix(ExtraFields& ef, const EntryRecord& e, bool central) {
+    const auto m = static_cast<std::uint32_t>(e.mtime_unix);
+    const auto a = static_cast<std::uint32_t>(e.atime_unix);
+    const auto c = static_cast<std::uint32_t>(e.ctime_unix);
+    const bool has_a = (a != m);
+    const bool has_c = (c != m);
+    std::byte payload[1 + 4 + 4 + 4]{};
+    payload[0] = static_cast<std::byte>(0x01u | (has_a ? 0x02u : 0u) |
+                                        (has_c ? 0x04u : 0u));
+    std::size_t n = 1;
+    auto put32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            payload[n++] = static_cast<std::byte>((v >> (8 * i)) & 0xFFu);
+        }
+    };
+    put32(m);
+    if (!central) {
+        if (has_a) put32(a);
+        if (has_c) put32(c);
+    }
+    ef.add(kExtraUT, std::span<const std::byte>{payload, n});
+
+    // Unix "ux" extra: 1 byte version + 1 byte uid size + uid + 1 byte gid
+    // size + gid (2-byte uid/gid). Omitted for uid = gid = 0: we don't
+    // capture ownership, and recording root:root is both wasted bytes and
+    // wrong when extracting as root.
+    if (e.uid != 0 || e.gid != 0) {
+        std::byte ux[1 + 1 + 2 + 1 + 2]{};
+        ux[0] = static_cast<std::byte>(1);  // version
+        ux[1] = static_cast<std::byte>(2);  // uid size
+        ux[2] = static_cast<std::byte>(e.uid & 0xFFu);
+        ux[3] = static_cast<std::byte>((e.uid >> 8) & 0xFFu);
+        ux[4] = static_cast<std::byte>(2);  // gid size
+        ux[5] = static_cast<std::byte>(e.gid & 0xFFu);
+        ux[6] = static_cast<std::byte>((e.gid >> 8) & 0xFFu);
+        ef.add(kExtraUnix, std::span<const std::byte>{ux, 7});
+    }
+}
+
 // Build the extra-fields block for a LOCAL file header.
 // Local headers only carry the ZIP64 sizes (no offset needed there).
 auto build_local_extra(const EntryRecord& e, bool include_ut_unix)
@@ -128,32 +178,7 @@ auto build_local_extra(const EntryRecord& e, bool include_ut_unix)
         }
         ef.add(kExtraZip64, std::span<const std::byte>{payload, 16});
     }
-    if (include_ut_unix) {
-        // UT extra: 1 byte flags + optional mtime/atime/ctime (u32 each).
-        // flags bit 0 = mtime present, bit 1 = atime, bit 2 = ctime.
-        std::byte payload[1 + 4 + 4 + 4]{};
-        payload[0] = static_cast<std::byte>(0x07u);  // mtime+atime+ctime
-        auto m = static_cast<std::uint32_t>(e.mtime_unix);
-        auto a = static_cast<std::uint32_t>(e.atime_unix);
-        auto c = static_cast<std::uint32_t>(e.ctime_unix);
-        for (int i = 0; i < 4; ++i) {
-            payload[1 + i]  = static_cast<std::byte>((m >> (8 * i)) & 0xFFu);
-            payload[5 + i]  = static_cast<std::byte>((a >> (8 * i)) & 0xFFu);
-            payload[9 + i]  = static_cast<std::byte>((c >> (8 * i)) & 0xFFu);
-        }
-        ef.add(kExtraUT, std::span<const std::byte>{payload, 13});
-        // Unix "ux" extra: 1 byte version + 1 byte uid size + uid +
-        // 1 byte gid size + gid. We use 2-byte uid/gid.
-        std::byte ux[1 + 1 + 2 + 1 + 2]{};
-        ux[0] = static_cast<std::byte>(1);  // version
-        ux[1] = static_cast<std::byte>(2);  // uid size
-        ux[2] = static_cast<std::byte>(e.uid & 0xFFu);
-        ux[3] = static_cast<std::byte>((e.uid >> 8) & 0xFFu);
-        ux[4] = static_cast<std::byte>(2);  // gid size
-        ux[5] = static_cast<std::byte>(e.gid & 0xFFu);
-        ux[6] = static_cast<std::byte>((e.gid >> 8) & 0xFFu);
-        ef.add(kExtraUnix, std::span<const std::byte>{ux, 7});
-    }
+    if (include_ut_unix) add_ut_unix(ef, e, /*central=*/false);
     auto d = ef.data();
     return std::vector<std::byte>{d.begin(), d.end()};
 }
@@ -177,28 +202,7 @@ auto build_central_extra(const EntryRecord& e, bool include_ut_unix)
         }
         ef.add(kExtraZip64, std::span<const std::byte>{payload, 24});
     }
-    if (include_ut_unix) {
-        std::byte payload[1 + 4 + 4 + 4]{};
-        payload[0] = static_cast<std::byte>(0x07u);
-        auto m = static_cast<std::uint32_t>(e.mtime_unix);
-        auto a = static_cast<std::uint32_t>(e.atime_unix);
-        auto c = static_cast<std::uint32_t>(e.ctime_unix);
-        for (int i = 0; i < 4; ++i) {
-            payload[1 + i]  = static_cast<std::byte>((m >> (8 * i)) & 0xFFu);
-            payload[5 + i]  = static_cast<std::byte>((a >> (8 * i)) & 0xFFu);
-            payload[9 + i]  = static_cast<std::byte>((c >> (8 * i)) & 0xFFu);
-        }
-        ef.add(kExtraUT, std::span<const std::byte>{payload, 13});
-        std::byte ux[1 + 1 + 2 + 1 + 2]{};
-        ux[0] = static_cast<std::byte>(1);
-        ux[1] = static_cast<std::byte>(2);
-        ux[2] = static_cast<std::byte>(e.uid & 0xFFu);
-        ux[3] = static_cast<std::byte>((e.uid >> 8) & 0xFFu);
-        ux[4] = static_cast<std::byte>(2);
-        ux[5] = static_cast<std::byte>(e.gid & 0xFFu);
-        ux[6] = static_cast<std::byte>((e.gid >> 8) & 0xFFu);
-        ef.add(kExtraUnix, std::span<const std::byte>{ux, 7});
-    }
+    if (include_ut_unix) add_ut_unix(ef, e, /*central=*/true);
     auto d = ef.data();
     return std::vector<std::byte>{d.begin(), d.end()};
 }
@@ -412,10 +416,11 @@ auto write_zip_impl(const std::string& archive_path,
         r.compressed_size = ce.data.size();
         r.zip64_entry = needs_zip64_size(r.uncompressed_size, r.compressed_size);
 
-        auto local_extra = build_local_extra(r, /*include_ut_unix=*/true);
+        auto local_extra = build_local_extra(r, /*include_ut_unix=*/false);
 
         const std::uint64_t header_size = 30 + r.name.size() + local_extra.size();
-        const bool align = r.uncompressed_size >= kDataAlignment;
+        const bool align = r.method == kMethodStore &&
+                           r.uncompressed_size >= kDataAlignment;
         std::uint64_t data_start = offset + header_size;
         if (align && data_start % kDataAlignment != 0) {
             std::uint64_t pad = kDataAlignment - (data_start % kDataAlignment);
@@ -434,7 +439,7 @@ auto write_zip_impl(const std::string& archive_path,
 
     std::uint64_t cd_offset = offset;
     for (const auto& r : records) {
-        auto central_extra = build_central_extra(r, /*include_ut_unix=*/true);
+        auto central_extra = build_central_extra(r, /*include_ut_unix=*/false);
         write_central_header(out, r, central_extra);
     }
     std::uint64_t cd_end = static_cast<std::uint64_t>(out.tellp());
