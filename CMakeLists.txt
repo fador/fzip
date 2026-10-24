@@ -13,6 +13,8 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+option(FZIP_BUILD_GUI "Build the optional fzip-gui application" OFF)
+
 # Warnings as errors (MSVC and Clang/GCC-compatible).
 if(MSVC)
     add_compile_options(/W4 /WX /permissive- /Zc:__cplusplus /Zc:preprocessor
@@ -27,9 +29,11 @@ if(NOT CMAKE_RUNTIME_LIBRARY_DIRECTORY)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 endif()
 
-# --- fzip -------------------------------------------------------------------
-add_executable(fzip
-    src/main.cpp
+# Thread pool support
+find_package(Threads REQUIRED)
+
+# --- fzip_core ---------------------------------------------------------------
+add_library(fzip_core STATIC
     src/zip_writer.cpp
     src/zip_reader.cpp
     src/crc32.cpp
@@ -43,12 +47,65 @@ add_executable(fzip
     src/xxhash.cpp
     src/codec.cpp
     src/file_type.cpp)
-target_include_directories(fzip PRIVATE src)
+target_include_directories(fzip_core PUBLIC src)
+target_compile_features(fzip_core PUBLIC cxx_std_20)
+target_link_libraries(fzip_core PUBLIC Threads::Threads)
+
+# --- fzip CLI ----------------------------------------------------------------
+add_executable(fzip src/main.cpp)
+target_link_libraries(fzip PRIVATE fzip_core)
 target_compile_features(fzip PRIVATE cxx_std_20)
 
-# Per-file compression runs on a thread pool.
-find_package(Threads REQUIRED)
-target_link_libraries(fzip PRIVATE Threads::Threads)
+# --- Optional fzip-gui -------------------------------------------------------
+if(FZIP_BUILD_GUI)
+    include(FetchContent)
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG v1.91.8
+    )
+    FetchContent_MakeAvailable(imgui)
+
+    set(IMGUI_SRCS
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_demo.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    )
+
+    if(WIN32)
+        list(APPEND IMGUI_SRCS
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+            ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
+        )
+    endif()
+
+    add_library(imgui_lib STATIC ${IMGUI_SRCS})
+    target_include_directories(imgui_lib PUBLIC
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
+    )
+    # Suppress warnings in third-party ImGui
+    if(MSVC)
+        target_compile_options(imgui_lib PRIVATE /W0)
+    else()
+        target_compile_options(imgui_lib PRIVATE -w)
+    endif()
+
+    add_executable(fzip-gui
+        src/gui/gui_main.cpp
+        src/gui/app_state.cpp
+        src/gui/native_dialogs.cpp
+        src/gui/context_menu.cpp
+    )
+    target_include_directories(fzip-gui PRIVATE src src/gui)
+    target_link_libraries(fzip-gui PRIVATE fzip_core imgui_lib)
+
+    if(WIN32)
+        target_link_libraries(fzip-gui PRIVATE d3d11 dxgi d3dcompiler ole32 uuid shell32 advapi32 comdlg32)
+    endif()
+endif()
 
 # --- Tests ------------------------------------------------------------------
 enable_testing()

@@ -7,6 +7,7 @@
 #include <ctime>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <span>
 #include <thread>
 #include <vector>
@@ -352,23 +353,49 @@ namespace {
 template <typename CompressFn>
 auto write_zip_impl(const std::string& archive_path,
                     const std::vector<ZipEntry>& entries,
-                    CompressFn&& compress_one) -> bool {
+                    CompressFn&& compress_one,
+                    ProgressCallback on_progress) -> bool {
     const std::size_t n = entries.size();
 
     // --- Compress all entries (parallel where beneficial) ---
     std::vector<std::uint32_t> crcs(n, 0);
     std::vector<CompressedEntry> compressed(n);
+    std::atomic<bool> cancelled{false};
+    std::atomic<std::size_t> completed_count{0};
+    std::mutex progress_mutex;
+
     auto do_one = [&](std::size_t i) {
+        if (cancelled.load(std::memory_order_relaxed)) return;
         const auto& e = entries[i];
         crcs[i] = crc32(std::span<const std::byte>{e.data});
         compressed[i] = compress_one(std::span<const std::byte>{e.data},
                                      std::string_view{e.name});
+
+        std::size_t done = completed_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (on_progress) {
+            std::lock_guard<std::mutex> lock(progress_mutex);
+            if (!cancelled.load(std::memory_order_relaxed)) {
+                EntryReport rep{
+                    .index = i,
+                    .name = e.name,
+                    .uncompressed_size = e.data.size(),
+                    .compressed_size = compressed[i].data.size(),
+                    .codec = compressed[i].codec
+                };
+                if (!on_progress(done, n, rep)) {
+                    cancelled.store(true, std::memory_order_relaxed);
+                }
+            }
+        }
     };
 
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 1;
     if (n < 2 || hw <= 1) {
-        for (std::size_t i = 0; i < n; ++i) do_one(i);
+        for (std::size_t i = 0; i < n; ++i) {
+            do_one(i);
+            if (cancelled.load(std::memory_order_relaxed)) return false;
+        }
     } else {
         const unsigned nw =
             std::min<unsigned>(hw, static_cast<unsigned>(n));
@@ -378,6 +405,7 @@ auto write_zip_impl(const std::string& archive_path,
         for (unsigned t = 0; t < nw; ++t) {
             workers.emplace_back([&]() {
                 for (;;) {
+                    if (cancelled.load(std::memory_order_relaxed)) break;
                     std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
                     if (i >= n) break;
                     do_one(i);
@@ -386,6 +414,8 @@ auto write_zip_impl(const std::string& archive_path,
         }
         for (auto& w : workers) w.join();
     }
+
+    if (cancelled.load(std::memory_order_relaxed)) return false;
 
     // --- Write local headers + data + central directory, in order ---
     std::ofstream out(archive_path, std::ios::binary | std::ios::trunc);
@@ -454,33 +484,32 @@ auto write_zip_impl(const std::string& archive_path,
 
 auto write_zip(const std::string& archive_path,
                const std::vector<ZipEntry>& entries,
-               CodecId codec, int level) -> bool {
+               CodecId codec, int level,
+               ProgressCallback on_progress) -> bool {
     return write_zip_impl(
         archive_path, entries,
         [codec, level](std::span<const std::byte> data,
                        std::string_view name) {
             return compress(codec, data, level, name);
-        });
+        },
+        std::move(on_progress));
 }
 
-auto write_store_zip(const std::string& archive_path,
-                     const std::vector<std::string>& file_paths) -> bool {
+auto collect_entries(const std::vector<std::string>& paths)
+    -> std::vector<ZipEntry> {
     namespace fs = std::filesystem;
-
     std::vector<ZipEntry> entries;
-    entries.reserve(file_paths.size());
 
-    for (const auto& path : file_paths) {
-        fs::path p(path);
+    auto add_file = [&](const fs::path& file_path, const std::string& entry_name) {
         ZipEntry e;
-        e.name = p.filename().string();
-        e.data = io::read_file(path);
-        // Convert fs::last_write_time (file_clock) to Unix seconds.
-        // file_clock since C++20 is the same as system_clock on Windows
-        // MSVC, but to be portable we go through to_time_t.
-        auto ftime = fs::last_write_time(p);
-        auto sctime = std::chrono::time_point_cast<std::chrono::seconds>(
-            ftime);
+        e.name = entry_name;
+        // Normalize any Windows backslashes in entry name to forward slashes
+        for (char& c : e.name) {
+            if (c == '\\') c = '/';
+        }
+        e.data = io::read_file(file_path.string());
+        auto ftime = fs::last_write_time(file_path);
+        auto sctime = std::chrono::time_point_cast<std::chrono::seconds>(ftime);
         auto since = sctime.time_since_epoch();
         auto secs = std::chrono::duration_cast<std::chrono::seconds>(since);
         e.mtime_unix = static_cast<std::uint64_t>(secs.count());
@@ -488,18 +517,44 @@ auto write_store_zip(const std::string& archive_path,
         e.mod_time = dos_t;
         e.mod_date = dos_d;
         entries.push_back(std::move(e));
-    }
+    };
 
+    for (const auto& item : paths) {
+        fs::path p(item);
+        std::error_code ec;
+        if (!fs::exists(p, ec)) continue;
+
+        if (fs::is_directory(p, ec)) {
+            // For a directory, the root component is the directory name itself
+            fs::path base_parent = p.parent_path();
+            for (const auto& dir_entry : fs::recursive_directory_iterator(p, ec)) {
+                if (dir_entry.is_regular_file(ec)) {
+                    fs::path rel = base_parent.empty() ? dir_entry.path() : fs::relative(dir_entry.path(), base_parent, ec);
+                    add_file(dir_entry.path(), rel.generic_string());
+                }
+            }
+        } else if (fs::is_regular_file(p, ec)) {
+            add_file(p, p.filename().generic_string());
+        }
+    }
+    return entries;
+}
+
+auto write_store_zip(const std::string& archive_path,
+                     const std::vector<std::string>& file_paths) -> bool {
+    auto entries = collect_entries(file_paths);
     return write_zip(archive_path, entries, CodecId::Store, 0);
 }
 
 auto write_zip_auto(const std::string& archive_path,
-                    const std::vector<ZipEntry>& entries, int level) -> bool {
+                    const std::vector<ZipEntry>& entries, int level,
+                    ProgressCallback on_progress) -> bool {
     return write_zip_impl(
         archive_path, entries,
         [level](std::span<const std::byte> data, std::string_view name) {
             return compress_auto(data, name, level);
-        });
+        },
+        std::move(on_progress));
 }
 
 }  // namespace fzip
