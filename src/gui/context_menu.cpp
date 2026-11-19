@@ -51,10 +51,31 @@ std::wstring to_wide(const std::string& str) {
     return w;
 }
 
+bool register_verb(const std::wstring& shell_root,
+                   const std::wstring& key_name,
+                   const std::wstring& label,
+                   const std::wstring& icon,
+                   const std::wstring& command) {
+    const std::wstring base = shell_root + L"\\" + key_name;
+    bool ok = true;
+    ok &= reg_set_string(HKEY_CURRENT_USER, base, L"", label);
+    ok &= reg_set_string(HKEY_CURRENT_USER, base, L"Icon", icon);
+    ok &= reg_set_string(HKEY_CURRENT_USER, base + L"\\command", L"", command);
+    return ok;
+}
+
+constexpr const wchar_t* kZipShellRoots[] = {
+    L"Software\\Classes\\SystemFileAssociations\\.zip\\shell",
+    L"Software\\Classes\\.zip\\shell",
+    L"Software\\Classes\\CompressedFolder\\shell",
+};
+
 }  // namespace
 
 auto check_context_menu_status() -> ContextMenuStatus {
-    if (reg_key_exists(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\fzip.compress")) {
+    if (reg_key_exists(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\fzip.compress") &&
+        reg_key_exists(HKEY_CURRENT_USER,
+                       L"Software\\Classes\\SystemFileAssociations\\.zip\\shell\\fzip.extract_sub")) {
         return ContextMenuStatus::Registered;
     }
     return ContextMenuStatus::NotRegistered;
@@ -66,39 +87,26 @@ auto register_context_menu(const std::string& exe_path) -> bool {
 
     bool ok = true;
 
-    // 1. All files: "Compress with fzip..."
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\fzip.compress", L"", L"Compress with fzip...");
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\fzip.compress", L"Icon", quote_exe);
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\fzip.compress\\command", L"", quote_exe + L" --compress-dialog \"%1\"");
+    // 1. Files and directories: "Compress with fzip..." & "Quick Compress"
+    for (const wchar_t* root : {
+             L"Software\\Classes\\*\\shell",
+             L"Software\\Classes\\Directory\\shell",
+         }) {
+        ok &= register_verb(root, L"fzip.compress", L"Compress with fzip...",
+                            quote_exe, quote_exe + L" --compress-dialog \"%1\"");
+        ok &= register_verb(root, L"fzip.quick", L"Quick Compress to .zip (fzip)",
+                            quote_exe, quote_exe + L" --quick-compress \"%1\"");
+    }
 
-    // Quick compress to .zip
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\fzip.quick", L"", L"Quick Compress to .zip (fzip)");
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\fzip.quick", L"Icon", quote_exe);
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\fzip.quick\\command", L"", quote_exe + L" --quick-compress \"%1\"");
-
-    // 2. Directories: "Compress with fzip..."
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\fzip.compress", L"", L"Compress with fzip...");
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\fzip.compress", L"Icon", quote_exe);
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\fzip.compress\\command", L"", quote_exe + L" --compress-dialog \"%1\"");
-
-    // Quick compress directory to .zip
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\fzip.quick", L"", L"Quick Compress to .zip (fzip)");
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\fzip.quick", L"Icon", quote_exe);
-    ok &= reg_set_string(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\fzip.quick\\command", L"", quote_exe + L" --quick-compress \"%1\"");
-
-    // 3. .zip archives: "Extract Here (fzip)" and "Extract to folder (fzip)"
-    std::wstring zip_base = L"Software\\Classes\\SystemFileAssociations\\.zip\\shell";
-    ok &= reg_set_string(HKEY_CURRENT_USER, zip_base + L"\\fzip.extract_here", L"", L"Extract Here (fzip)");
-    ok &= reg_set_string(HKEY_CURRENT_USER, zip_base + L"\\fzip.extract_here", L"Icon", quote_exe);
-    ok &= reg_set_string(HKEY_CURRENT_USER, zip_base + L"\\fzip.extract_here\\command", L"", quote_exe + L" --extract-here \"%1\"");
-
-    ok &= reg_set_string(HKEY_CURRENT_USER, zip_base + L"\\fzip.extract_sub", L"", L"Extract to folder (fzip)");
-    ok &= reg_set_string(HKEY_CURRENT_USER, zip_base + L"\\fzip.extract_sub", L"Icon", quote_exe);
-    ok &= reg_set_string(HKEY_CURRENT_USER, zip_base + L"\\fzip.extract_sub\\command", L"", quote_exe + L" --extract-subdir \"%1\"");
-
-    ok &= reg_set_string(HKEY_CURRENT_USER, zip_base + L"\\fzip.inspect", L"", L"Open with fzip");
-    ok &= reg_set_string(HKEY_CURRENT_USER, zip_base + L"\\fzip.inspect", L"Icon", quote_exe);
-    ok &= reg_set_string(HKEY_CURRENT_USER, zip_base + L"\\fzip.inspect\\command", L"", quote_exe + L" \"%1\"");
+    // 2. .zip archives across all Explorer association lookup paths
+    for (const wchar_t* zip_base : kZipShellRoots) {
+        ok &= register_verb(zip_base, L"fzip.extract_here", L"Extract Here (fzip)",
+                            quote_exe, quote_exe + L" --extract-here \"%1\"");
+        ok &= register_verb(zip_base, L"fzip.extract_sub", L"Extract to folder... (fzip)",
+                            quote_exe, quote_exe + L" --extract-subdir \"%1\"");
+        ok &= register_verb(zip_base, L"fzip.inspect", L"Open with fzip",
+                            quote_exe, quote_exe + L" \"%1\"");
+    }
 
     return ok;
 }
@@ -108,9 +116,12 @@ auto unregister_context_menu() -> bool {
     reg_delete_tree(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\fzip.quick");
     reg_delete_tree(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\fzip.compress");
     reg_delete_tree(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\fzip.quick");
-    reg_delete_tree(HKEY_CURRENT_USER, L"Software\\Classes\\SystemFileAssociations\\.zip\\shell\\fzip.extract_here");
-    reg_delete_tree(HKEY_CURRENT_USER, L"Software\\Classes\\SystemFileAssociations\\.zip\\shell\\fzip.extract_sub");
-    reg_delete_tree(HKEY_CURRENT_USER, L"Software\\Classes\\SystemFileAssociations\\.zip\\shell\\fzip.inspect");
+    for (const wchar_t* zip_base : kZipShellRoots) {
+        const std::wstring base(zip_base);
+        reg_delete_tree(HKEY_CURRENT_USER, base + L"\\fzip.extract_here");
+        reg_delete_tree(HKEY_CURRENT_USER, base + L"\\fzip.extract_sub");
+        reg_delete_tree(HKEY_CURRENT_USER, base + L"\\fzip.inspect");
+    }
     return true;
 }
 

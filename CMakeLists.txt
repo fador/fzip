@@ -111,7 +111,9 @@ if(FZIP_BUILD_GUI)
     target_link_libraries(fzip-gui PRIVATE fzip_core imgui_lib)
 
     if(WIN32)
-        target_link_libraries(fzip-gui PRIVATE d3d11 dxgi d3dcompiler ole32 uuid shell32 advapi32 comdlg32)
+        set_target_properties(fzip-gui PROPERTIES WIN32_EXECUTABLE TRUE)
+        target_compile_definitions(fzip-gui PRIVATE FZIP_GUI_WINMAIN NOMINMAX)
+        target_link_libraries(fzip-gui PRIVATE d3d11 dxgi d3dcompiler ole32 uuid shell32 advapi32 comdlg32 dwmapi)
     endif()
 endif()
 
