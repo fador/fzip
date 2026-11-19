@@ -236,8 +236,12 @@ auto decode_literals(const std::byte* data, std::size_t size,
             }
             streams = body + weight_consumed;
             streams_size = static_cast<std::size_t>(csize) - weight_consumed;
-            tbl = &local;
-            if (prev_huf != nullptr) *prev_huf = local;
+            if (prev_huf != nullptr) {
+                *prev_huf = std::move(local);
+                tbl = prev_huf;
+            } else {
+                tbl = &local;
+            }
         } else {
             if (prev_huf == nullptr || prev_huf->table_log == 0) {
                 throw ZstdError(

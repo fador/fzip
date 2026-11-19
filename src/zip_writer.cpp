@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <numeric>
 #include <span>
 #include <thread>
 #include <vector>
@@ -80,15 +81,41 @@ struct EntryRecord {
     std::uint16_t gid = 0;
 };
 
+// Byte-vector serialization helpers for ZIP headers.
+template <std::size_t N>
+inline void append_le(std::vector<std::byte>& out, std::uint64_t value) {
+    static_assert(N >= 1 && N <= 8);
+    const std::size_t old = out.size();
+    out.resize(old + N);
+    for (std::size_t i = 0; i < N; ++i) {
+        out[old + i] = static_cast<std::byte>(value & 0xFFu);
+        value >>= 8;
+    }
+}
+inline void append_u16(std::vector<std::byte>& out, std::uint16_t v) { append_le<2>(out, v); }
+inline void append_u32(std::vector<std::byte>& out, std::uint32_t v) { append_le<4>(out, v); }
+inline void append_u64(std::vector<std::byte>& out, std::uint64_t v) { append_le<8>(out, v); }
+inline void append_bytes(std::vector<std::byte>& out, std::span<const std::byte> data) {
+    if (!data.empty()) {
+        out.insert(out.end(), data.begin(), data.end());
+    }
+}
+inline void append_string(std::vector<std::byte>& out, std::string_view s) {
+    if (!s.empty()) {
+        const auto* p = reinterpret_cast<const std::byte*>(s.data());
+        out.insert(out.end(), p, p + s.size());
+    }
+}
+
 // A small helper to build up an extra-field block in memory before writing
 // it into a header. Extra fields are a sequence of (HeaderID u16, Size u16,
 // Data[Size]) records.
 class ExtraFields {
   public:
     void add(std::uint16_t id, std::span<const std::byte> payload) {
-        io::write_u16(buf_, id);
-        io::write_u16(buf_, static_cast<std::uint16_t>(payload.size()));
-        io::write_bytes(buf_, payload);
+        append_u16(buf_, id);
+        append_u16(buf_, static_cast<std::uint16_t>(payload.size()));
+        append_bytes(buf_, payload);
     }
     void add_u16(std::uint16_t id, std::uint16_t v) {
         std::byte b[2]{};
@@ -104,17 +131,15 @@ class ExtraFields {
         add(id, std::span<const std::byte>{b, 4});
     }
     auto data() const -> std::span<const std::byte> {
-        return std::span<const std::byte>{
-            reinterpret_cast<const std::byte*>(buf_.str().data()),
-            buf_.str().size()};
+        return std::span<const std::byte>{buf_.data(), buf_.size()};
     }
     auto size() const -> std::uint16_t {
-        return static_cast<std::uint16_t>(buf_.str().size());
+        return static_cast<std::uint16_t>(buf_.size());
     }
+    void clear() { buf_.clear(); }
 
   private:
-    // We serialize into a string-stream backed buffer.
-    std::ostringstream buf_;
+    std::vector<std::byte> buf_;
 };
 
 // Append the UT (Unix timestamp) and, when meaningful, the "ux" (UID/GID)
@@ -164,11 +189,11 @@ void add_ut_unix(ExtraFields& ef, const EntryRecord& e, bool central) {
     }
 }
 
-// Build the extra-fields block for a LOCAL file header.
+// Build the extra-fields block for a LOCAL file header into `ef`.
 // Local headers only carry the ZIP64 sizes (no offset needed there).
-auto build_local_extra(const EntryRecord& e, bool include_ut_unix)
-    -> std::vector<std::byte> {
-    ExtraFields ef;
+void build_local_extra(const EntryRecord& e, bool include_ut_unix,
+                       ExtraFields& ef) {
+    ef.clear();
     if (e.zip64_entry) {
         std::byte payload[16]{};
         for (int i = 0; i < 8; ++i) {
@@ -180,17 +205,12 @@ auto build_local_extra(const EntryRecord& e, bool include_ut_unix)
         ef.add(kExtraZip64, std::span<const std::byte>{payload, 16});
     }
     if (include_ut_unix) add_ut_unix(ef, e, /*central=*/false);
-    auto d = ef.data();
-    return std::vector<std::byte>{d.begin(), d.end()};
 }
 
-// Build the extra-fields block for a CENTRAL directory header.
-// The central directory carries ZIP64 sizes+offset, and the UT/Unix fields
-// (UT in central is the same content per APPNOTE; some writers omit atime/
-// ctime in central — we keep them for simplicity).
-auto build_central_extra(const EntryRecord& e, bool include_ut_unix)
-    -> std::vector<std::byte> {
-    ExtraFields ef;
+// Build the extra-fields block for a CENTRAL directory header into `ef`.
+void build_central_extra(const EntryRecord& e, bool include_ut_unix,
+                         ExtraFields& ef) {
+    ef.clear();
     if (e.zip64_entry) {
         std::byte payload[24]{};
         for (int i = 0; i < 8; ++i) {
@@ -204,122 +224,105 @@ auto build_central_extra(const EntryRecord& e, bool include_ut_unix)
         ef.add(kExtraZip64, std::span<const std::byte>{payload, 24});
     }
     if (include_ut_unix) add_ut_unix(ef, e, /*central=*/true);
-    auto d = ef.data();
-    return std::vector<std::byte>{d.begin(), d.end()};
 }
 
-// Write the local file header for an entry. `extra` is the pre-built extra
-// field block. Returns the number of bytes written (30 + name + extra).
+// Serialize and write the local file header for an entry using `buf`.
+// Returns the number of bytes written (30 + name + extra).
 auto write_local_header(std::ostream& out, const EntryRecord& e,
-                        std::span<const std::byte> extra) -> std::uint64_t {
-    io::write_u32(out, kSigLocalHeader);
-    io::write_u16(out, e.zip64_entry ? kVersionZip64 : kVersionClassic);
-    io::write_u16(out, e.flags);
-    io::write_u16(out, e.method);
-    io::write_u16(out, e.mod_time);
-    io::write_u16(out, e.mod_date);
-    io::write_u32(out, e.crc32);
-    io::write_u32(out, e.zip64_entry ? k32Sentinel
-                                     : static_cast<std::uint32_t>(e.compressed_size));
-    io::write_u32(out, e.zip64_entry ? k32Sentinel
-                                     : static_cast<std::uint32_t>(e.uncompressed_size));
-    io::write_u16(out, static_cast<std::uint16_t>(e.name.size()));
-    io::write_u16(out, static_cast<std::uint16_t>(extra.size()));
-    io::write_string(out, e.name);
-    io::write_bytes(out, extra);
-    return 30 + e.name.size() + extra.size();
+                        std::span<const std::byte> extra,
+                        std::vector<std::byte>& buf) -> std::uint64_t {
+    buf.clear();
+    append_u32(buf, kSigLocalHeader);
+    append_u16(buf, e.zip64_entry ? kVersionZip64 : kVersionClassic);
+    append_u16(buf, e.flags);
+    append_u16(buf, e.method);
+    append_u16(buf, e.mod_time);
+    append_u16(buf, e.mod_date);
+    append_u32(buf, e.crc32);
+    append_u32(buf, e.zip64_entry ? k32Sentinel
+                                  : static_cast<std::uint32_t>(e.compressed_size));
+    append_u32(buf, e.zip64_entry ? k32Sentinel
+                                  : static_cast<std::uint32_t>(e.uncompressed_size));
+    append_u16(buf, static_cast<std::uint16_t>(e.name.size()));
+    append_u16(buf, static_cast<std::uint16_t>(extra.size()));
+    append_string(buf, e.name);
+    append_bytes(buf, extra);
+    io::write_bytes(out, buf);
+    return buf.size();
 }
 
-// Write one central-directory header.
-auto write_central_header(std::ostream& out, const EntryRecord& e,
-                          std::span<const std::byte> extra) {
-    io::write_u32(out, kSigCentralHeader);
-    io::write_u16(out, 0x031Eu);  // version made by: UNIX (3) + 30 (3.0)
-    io::write_u16(out, e.zip64_entry ? kVersionZip64 : kVersionClassic);
-    io::write_u16(out, e.flags);
-    io::write_u16(out, e.method);
-    io::write_u16(out, e.mod_time);
-    io::write_u16(out, e.mod_date);
-    io::write_u32(out, e.crc32);
-    io::write_u32(out, e.zip64_entry ? k32Sentinel
-                                     : static_cast<std::uint32_t>(e.compressed_size));
-    io::write_u32(out, e.zip64_entry ? k32Sentinel
-                                     : static_cast<std::uint32_t>(e.uncompressed_size));
-    io::write_u16(out, static_cast<std::uint16_t>(e.name.size()));
-    io::write_u16(out, static_cast<std::uint16_t>(extra.size()));
-    io::write_u16(out, 0);  // comment length
-    io::write_u16(out, 0);  // disk number start
-    io::write_u16(out, 0);  // internal attributes
-    io::write_u32(out, 0);  // external attributes (0 = normal)
-    io::write_u32(out, e.zip64_entry && e.local_header_offset >= k32Sentinel
-                         ? k32Sentinel
-                         : static_cast<std::uint32_t>(e.local_header_offset));
-    io::write_string(out, e.name);
-    io::write_bytes(out, extra);
-}
-
-// Write padding bytes to align the next write to a multiple of
-// `kDataAlignment` from the start of the archive. We insert a dummy extra
-// field (header 0x0000, zero-payload) sized to reach the target offset.
-// Because the local header itself is variable-length, we compute the padding
-// *after* writing the real extra fields, by extending the extra block.
-auto write_alignment_padding(std::ostream& out, std::uint64_t current_offset)
-    -> std::uint64_t {
-    if (current_offset % kDataAlignment == 0) return 0;
-    std::uint64_t pad = kDataAlignment - (current_offset % kDataAlignment);
-    // We must write pad bytes of raw padding. We use a "data descriptor"-
-    // free approach: insert raw zero bytes between entries. This is legal
-    // because the central directory records the actual local header offset,
-    // and readers scan via the central directory, not sequentially.
-    std::string zeros(pad, '\0');
-    out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
-    return pad;
+// Serialize and append one central-directory header into `buf`.
+void append_central_header(std::vector<std::byte>& buf, const EntryRecord& e,
+                           std::span<const std::byte> extra) {
+    append_u32(buf, kSigCentralHeader);
+    append_u16(buf, 0x031Eu);  // version made by: UNIX (3) + 30 (3.0)
+    append_u16(buf, e.zip64_entry ? kVersionZip64 : kVersionClassic);
+    append_u16(buf, e.flags);
+    append_u16(buf, e.method);
+    append_u16(buf, e.mod_time);
+    append_u16(buf, e.mod_date);
+    append_u32(buf, e.crc32);
+    append_u32(buf, e.zip64_entry ? k32Sentinel
+                                  : static_cast<std::uint32_t>(e.compressed_size));
+    append_u32(buf, e.zip64_entry ? k32Sentinel
+                                  : static_cast<std::uint32_t>(e.uncompressed_size));
+    append_u16(buf, static_cast<std::uint16_t>(e.name.size()));
+    append_u16(buf, static_cast<std::uint16_t>(extra.size()));
+    append_u16(buf, 0);  // comment length
+    append_u16(buf, 0);  // disk number start
+    append_u16(buf, 0);  // internal attributes
+    append_u32(buf, 0);  // external attributes (0 = normal)
+    append_u32(buf, e.zip64_entry && e.local_header_offset >= k32Sentinel
+                        ? k32Sentinel
+                        : static_cast<std::uint32_t>(e.local_header_offset));
+    append_string(buf, e.name);
+    append_bytes(buf, extra);
 }
 
 // Write the end-of-central-directory record, emitting ZIP64 records when
 // the archive exceeds classic limits.
 void write_eocd(std::ostream& out, std::uint64_t cd_size,
-                std::uint64_t cd_offset, std::uint64_t entry_count) {
+                std::uint64_t cd_offset, std::uint64_t entry_count,
+                std::vector<std::byte>& buf) {
+    buf.clear();
     const bool zip64 = entry_count >= k16Sentinel ||
                        cd_size >= k32Sentinel ||
                        cd_offset >= k32Sentinel;
 
     if (zip64) {
-        // EOCD64 record. The "size of remaining record" field counts the
-        // bytes after the 12-byte (sig + size) header: vmade(2) + vneed(2)
-        // + disk(4) + cd_disk(4) + n_disk(8) + n_total(8) + cd_size(8) +
-        // cd_off(8) = 44.
-        io::write_u32(out, 0x06064b50u);
-        io::write_u64(out, 44);  // size of remaining EOCD64 (fixed part)
-        io::write_u16(out, 0x031Eu);  // version made by
-        io::write_u16(out, kVersionZip64);
-        io::write_u32(out, 0);  // this disk number
-        io::write_u32(out, 0);  // disk with CD start
-        io::write_u64(out, entry_count);
-        io::write_u64(out, entry_count);
-        io::write_u64(out, cd_size);
-        io::write_u64(out, cd_offset);
+        // EOCD64 record.
+        append_u32(buf, 0x06064b50u);
+        append_u64(buf, 44);  // size of remaining EOCD64 (fixed part)
+        append_u16(buf, 0x031Eu);  // version made by
+        append_u16(buf, kVersionZip64);
+        append_u32(buf, 0);  // this disk number
+        append_u32(buf, 0);  // disk with CD start
+        append_u64(buf, entry_count);
+        append_u64(buf, entry_count);
+        append_u64(buf, cd_size);
+        append_u64(buf, cd_offset);
 
         // EOCD64 locator.
-        io::write_u32(out, 0x07064b50u);
-        io::write_u32(out, 0);  // disk with EOCD64
-        io::write_u64(out, cd_offset + cd_size);  // offset of EOCD64
-        io::write_u32(out, 1);  // total disks
+        append_u32(buf, 0x07064b50u);
+        append_u32(buf, 0);  // disk with EOCD64
+        append_u64(buf, cd_offset + cd_size);  // offset of EOCD64
+        append_u32(buf, 1);  // total disks
     }
 
     // Classic EOCD (always written; sentinels if ZIP64).
-    io::write_u32(out, kSigEocd);
-    io::write_u16(out, 0);  // this disk
-    io::write_u16(out, 0);  // disk with CD
-    io::write_u16(out, zip64 ? k16Sentinel
-                             : static_cast<std::uint16_t>(entry_count));
-    io::write_u16(out, zip64 ? k16Sentinel
-                             : static_cast<std::uint16_t>(entry_count));
-    io::write_u32(out, zip64 ? k32Sentinel
-                             : static_cast<std::uint32_t>(cd_size));
-    io::write_u32(out, zip64 ? k32Sentinel
-                             : static_cast<std::uint32_t>(cd_offset));
-    io::write_u16(out, 0);  // comment length
+    append_u32(buf, kSigEocd);
+    append_u16(buf, 0);  // this disk
+    append_u16(buf, 0);  // disk with CD
+    append_u16(buf, zip64 ? k16Sentinel
+                          : static_cast<std::uint16_t>(entry_count));
+    append_u16(buf, zip64 ? k16Sentinel
+                          : static_cast<std::uint16_t>(entry_count));
+    append_u32(buf, zip64 ? k32Sentinel
+                          : static_cast<std::uint32_t>(cd_size));
+    append_u32(buf, zip64 ? k32Sentinel
+                          : static_cast<std::uint32_t>(cd_offset));
+    append_u16(buf, 0);  // comment length
+    io::write_bytes(out, buf);
 }
 
 }  // namespace
@@ -375,11 +378,16 @@ auto write_zip_impl(const std::string& archive_path,
         if (on_progress) {
             std::lock_guard<std::mutex> lock(progress_mutex);
             if (!cancelled.load(std::memory_order_relaxed)) {
+                const std::uint64_t comp_sz =
+                    (compressed[i].codec == CodecId::Store &&
+                     compressed[i].data.empty())
+                        ? e.data.size()
+                        : compressed[i].data.size();
                 EntryReport rep{
                     .index = i,
                     .name = e.name,
                     .uncompressed_size = e.data.size(),
-                    .compressed_size = compressed[i].data.size(),
+                    .compressed_size = comp_sz,
                     .codec = compressed[i].codec
                 };
                 if (!on_progress(done, n, rep)) {
@@ -389,26 +397,39 @@ auto write_zip_impl(const std::string& archive_path,
         }
     };
 
+    // Process largest entries first (LPT) to avoid long-tail worker stragglers.
+    std::vector<std::size_t> work_order(n);
+    std::iota(work_order.begin(), work_order.end(), 0);
+    if (n > 1) {
+        std::sort(work_order.begin(), work_order.end(),
+                  [&](std::size_t a, std::size_t b) {
+                      return entries[a].data.size() > entries[b].data.size();
+                  });
+    }
+
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 1;
     if (n < 2 || hw <= 1) {
-        for (std::size_t i = 0; i < n; ++i) {
-            do_one(i);
+        detail::ThreadBudgetGuard budget(hw);
+        for (std::size_t idx = 0; idx < n; ++idx) {
+            do_one(work_order[idx]);
             if (cancelled.load(std::memory_order_relaxed)) return false;
         }
     } else {
         const unsigned nw =
             std::min<unsigned>(hw, static_cast<unsigned>(n));
+        const unsigned per_worker_budget = std::max(1u, hw / nw);
         std::atomic<std::size_t> next{0};
         std::vector<std::thread> workers;
         workers.reserve(nw);
         for (unsigned t = 0; t < nw; ++t) {
             workers.emplace_back([&]() {
+                detail::ThreadBudgetGuard budget(per_worker_budget);
                 for (;;) {
                     if (cancelled.load(std::memory_order_relaxed)) break;
-                    std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                    if (i >= n) break;
-                    do_one(i);
+                    std::size_t pos = next.fetch_add(1, std::memory_order_relaxed);
+                    if (pos >= n) break;
+                    do_one(work_order[pos]);
                 }
             });
         }
@@ -418,16 +439,28 @@ auto write_zip_impl(const std::string& archive_path,
     if (cancelled.load(std::memory_order_relaxed)) return false;
 
     // --- Write local headers + data + central directory, in order ---
-    std::ofstream out(archive_path, std::ios::binary | std::ios::trunc);
+    std::vector<char> io_buf(1 << 20);
+    std::ofstream out;
+    out.rdbuf()->pubsetbuf(io_buf.data(), static_cast<std::streamsize>(io_buf.size()));
+    out.open(archive_path, std::ios::binary | std::ios::trunc);
     if (!out) return false;
 
     std::vector<EntryRecord> records;
     records.reserve(n);
     std::uint64_t offset = 0;
+    ExtraFields ef;
+    std::vector<std::byte> hdr_buf;
+    hdr_buf.reserve(512);
+    static constexpr char kZeros[kDataAlignment]{};
 
     for (std::size_t i = 0; i < n; ++i) {
         const auto& entry = entries[i];
         const CompressedEntry& ce = compressed[i];
+        const bool store_direct =
+            (ce.codec == CodecId::Store && ce.data.empty() && !entry.data.empty());
+        const std::span<const std::byte> payload =
+            store_direct ? std::span<const std::byte>{entry.data}
+                         : std::span<const std::byte>{ce.data};
 
         EntryRecord r;
         r.name = entry.name;
@@ -443,39 +476,50 @@ auto write_zip_impl(const std::string& archive_path,
         r.gid = 0;
 
         r.method = static_cast<std::uint16_t>(ce.codec);
-        r.compressed_size = ce.data.size();
+        r.compressed_size = payload.size();
         r.zip64_entry = needs_zip64_size(r.uncompressed_size, r.compressed_size);
 
-        auto local_extra = build_local_extra(r, /*include_ut_unix=*/false);
+        build_local_extra(r, /*include_ut_unix=*/false, ef);
 
-        const std::uint64_t header_size = 30 + r.name.size() + local_extra.size();
+        const std::uint64_t header_size = 30 + r.name.size() + ef.size();
         const bool align = r.method == kMethodStore &&
                            r.uncompressed_size >= kDataAlignment;
         std::uint64_t data_start = offset + header_size;
         if (align && data_start % kDataAlignment != 0) {
             std::uint64_t pad = kDataAlignment - (data_start % kDataAlignment);
-            std::string zeros(pad, '\0');
-            out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+            out.write(kZeros, static_cast<std::streamsize>(pad));
             offset += pad;
         }
 
         r.local_header_offset = offset;
-        write_local_header(out, r, local_extra);
-        io::write_bytes(out, std::span<const std::byte>{ce.data});
+        write_local_header(out, r, ef.data(), hdr_buf);
+        if (!payload.empty()) {
+            io::write_bytes(out, payload);
+        }
 
         offset = r.local_header_offset + header_size + r.compressed_size;
         records.push_back(std::move(r));
     }
 
     std::uint64_t cd_offset = offset;
+    std::vector<std::byte> cd_buf;
+    cd_buf.reserve(std::min<std::size_t>(n * 96, 1u << 20));
+    std::uint64_t cd_size = 0;
     for (const auto& r : records) {
-        auto central_extra = build_central_extra(r, /*include_ut_unix=*/false);
-        write_central_header(out, r, central_extra);
+        build_central_extra(r, /*include_ut_unix=*/false, ef);
+        append_central_header(cd_buf, r, ef.data());
+        if (cd_buf.size() >= (1u << 19)) {
+            cd_size += cd_buf.size();
+            io::write_bytes(out, cd_buf);
+            cd_buf.clear();
+        }
     }
-    std::uint64_t cd_end = static_cast<std::uint64_t>(out.tellp());
-    std::uint64_t cd_size = cd_end - cd_offset;
+    if (!cd_buf.empty()) {
+        cd_size += cd_buf.size();
+        io::write_bytes(out, cd_buf);
+    }
 
-    write_eocd(out, cd_size, cd_offset, records.size());
+    write_eocd(out, cd_size, cd_offset, records.size(), hdr_buf);
     out.flush();
     return static_cast<bool>(out);
 }
@@ -490,7 +534,7 @@ auto write_zip(const std::string& archive_path,
         archive_path, entries,
         [codec, level](std::span<const std::byte> data,
                        std::string_view name) {
-            return compress(codec, data, level, name);
+            return detail::compress_for_writer(codec, data, level, name);
         },
         std::move(on_progress));
 }
@@ -552,7 +596,7 @@ auto write_zip_auto(const std::string& archive_path,
     return write_zip_impl(
         archive_path, entries,
         [level](std::span<const std::byte> data, std::string_view name) {
-            return compress_auto(data, name, level);
+            return detail::compress_auto_for_writer(data, name, level);
         },
         std::move(on_progress));
 }

@@ -17,11 +17,12 @@ namespace fzip::io {
 template <std::size_t N>
 void write_le(std::ostream& out, std::uint64_t value) {
     static_assert(N >= 1 && N <= 8);
+    char buf[N];
     for (std::size_t i = 0; i < N; ++i) {
-        auto byte = static_cast<char>(value & 0xFFu);
-        out.put(byte);
+        buf[i] = static_cast<char>(value & 0xFFu);
         value >>= 8;
     }
+    out.write(buf, static_cast<std::streamsize>(N));
 }
 
 inline void write_u16(std::ostream& out, std::uint16_t v) { write_le<2>(out, v); }

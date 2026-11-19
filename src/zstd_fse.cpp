@@ -2,6 +2,9 @@
 #include "zstd_fse.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cmath>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
@@ -13,10 +16,8 @@ namespace fzip::zstd {
 namespace {
 
 // floor(log2(x)), x > 0.
-auto highbit(std::uint32_t x) -> int {
-    int r = 0;
-    while (x > 1) { x >>= 1; ++r; }
-    return r;
+inline auto highbit(std::uint32_t x) -> int {
+    return std::bit_width(x) - 1;
 }
 
 // FSE table spread step. Distributes symbols across the table so that
@@ -143,101 +144,6 @@ auto build_fse_table(int accuracy_log, const int* norm_counts, int max_symbol)
     }
 
     return table;
-}
-
-// --------------------------------------------------------------------------
-// FSE reverse bitstream reader
-// --------------------------------------------------------------------------
-FseBitReader::FseBitReader(const std::byte* data, std::size_t size)
-    : data_(data), size_(size), pos_(0) {
-    // The FSE bitstream is written forward (LSB-first into bytes).
-    // The decoder reads it BACKWARD: bytes from end to start, and within
-    // each byte, bits from MSB to LSB. This is the reverse of writing.
-    //
-    // The sentinel is a 1-bit written just before the byte-align. When
-    // reading backward, the first 1-bit encountered is the sentinel.
-    // We skip past it by setting pos_ to the bit position just below it.
-    //
-    // Reading order: start at last byte, read bit 7 (MSB), bit 6, ..., bit 0.
-    // Then move to previous byte, read bit 7, bit 6, ..., bit 0.
-    // pos_ counts bits consumed from the end (going backward).
-    if (size > 0) {
-        // Find the sentinel: scan backward from the last byte.
-        // Within each byte, scan from MSB (bit 7) to LSB (bit 0).
-        for (std::size_t bi = 0; bi < size; ++bi) {
-            auto byte = static_cast<std::uint8_t>(data[size - 1 - bi]);
-            if (byte == 0) continue;
-            // Find the highest 1-bit in this byte (MSB-first reading).
-            for (int bit = 7; bit >= 0; --bit) {
-                if ((byte >> bit) & 1) {
-                    // Found sentinel. Skip past it.
-                    // pos_ = bits consumed so far + remaining bits in this byte.
-                    pos_ = bi * 8 + (7 - bit) + 1;
-                    return;
-                }
-            }
-        }
-    }
-}
-
-auto FseBitReader::read_bits(int n) -> std::uint32_t {
-    // The reverse bitstream recovers each multi-bit element in its original
-    // bit order (only the element order is reversed). Assemble MSB-first.
-    std::uint32_t v = 0;
-    for (int i = 0; i < n; ++i) {
-        if (pos_ >= size_ * 8) throw ZstdError("fse bitreader: underflow");
-        std::size_t byte_from_end = pos_ / 8;
-        std::size_t bit_from_msb = pos_ % 8;
-        std::size_t byte_idx = size_ - 1 - byte_from_end;
-        int bit_pos = 7 - static_cast<int>(bit_from_msb);  // MSB-first
-        std::uint32_t bit = (static_cast<std::uint8_t>(data_[byte_idx]) >> bit_pos) & 1u;
-        v = (v << 1) | bit;
-        ++pos_;
-    }
-    return v;
-}
-
-auto FseBitReader::peek_bits(int n) -> std::uint32_t {
-    std::uint32_t v = 0;
-    std::size_t p = pos_;
-    for (int i = 0; i < n; ++i) {
-        std::uint32_t bit = 0;
-        if (p < size_ * 8) {
-            std::size_t byte_from_end = p / 8;
-            std::size_t bit_from_msb = p % 8;
-            std::size_t byte_idx = size_ - 1 - byte_from_end;
-            int bit_pos = 7 - static_cast<int>(bit_from_msb);
-            bit = (static_cast<std::uint8_t>(data_[byte_idx]) >> bit_pos) & 1u;
-        }
-        v = (v << 1) | bit;
-        ++p;
-    }
-    return v;
-}
-
-auto FseBitReader::read_bits_padded(int n) -> std::uint32_t {
-    std::uint32_t v = 0;
-    for (int i = 0; i < n; ++i) {
-        std::uint32_t bit = 0;
-        if (pos_ < size_ * 8) {
-            std::size_t byte_from_end = pos_ / 8;
-            std::size_t bit_from_msb = pos_ % 8;
-            std::size_t byte_idx = size_ - 1 - byte_from_end;
-            int bit_pos = 7 - static_cast<int>(bit_from_msb);
-            bit = (static_cast<std::uint8_t>(data_[byte_idx]) >> bit_pos) & 1u;
-        }
-        v = (v << 1) | bit;
-        ++pos_;
-    }
-    return v;
-}
-
-auto FseBitReader::get_state(int accuracy_log) -> std::uint32_t {
-    return read_bits(accuracy_log);
-}
-
-auto FseBitReader::empty() const -> bool {
-    return pos_ >= size_ * 8;
 }
 
 // --------------------------------------------------------------------------
@@ -644,52 +550,6 @@ auto predefined_offset_norm() -> const int* {
 // Encoder implementation
 // ==========================================================================
 
-// --- FseBitWriter ---
-void FseBitWriter::put_bits(std::uint32_t value, int n) {
-    acc_ |= (value & ((1u << n) - 1u)) << acc_bits_;
-    acc_bits_ += n;
-    while (acc_bits_ >= 8) {
-        out_.push_back(static_cast<std::byte>(acc_ & 0xFFu));
-        acc_ >>= 8;
-        acc_bits_ -= 8;
-    }
-}
-
-void FseBitWriter::put_bit(bool bit) {
-    put_bits(bit ? 1u : 0u, 1);
-}
-
-void FseBitWriter::align_to_byte() {
-    while (acc_bits_ > 0) {
-        out_.push_back(static_cast<std::byte>(acc_ & 0xFFu));
-        acc_ >>= 8;
-        acc_bits_ -= 8;
-        if (acc_bits_ < 0) acc_bits_ = 0;
-    }
-}
-
-void FseBitWriter::put_byte(std::uint8_t byte) {
-    out_.push_back(static_cast<std::byte>(byte));
-}
-
-auto FseBitWriter::data() const -> const std::vector<std::byte>& {
-    return out_;
-}
-
-auto FseBitWriter::size() const -> std::size_t {
-    return out_.size();
-}
-
-auto FseBitWriter::bit_count() const -> std::size_t {
-    return out_.size() * 8 + acc_bits_;
-}
-
-void FseBitWriter::clear() {
-    out_.clear();
-    acc_ = 0;
-    acc_bits_ = 0;
-}
-
 // --- FSE normalization ---
 auto fse_normalize(const int* freqs, int num_symbols, int accuracy_log)
     -> std::vector<int> {
@@ -864,10 +724,8 @@ void write_fse_table_description(FseBitWriter& writer, int accuracy_log,
 namespace {
 
 // floor(log2(x)) for x >= 1.
-auto highbit_u32(std::uint32_t x) -> int {
-    int r = 0;
-    while (x > 1) { x >>= 1; ++r; }
-    return r;
+inline auto highbit_u32(std::uint32_t x) -> int {
+    return std::bit_width(x) - 1;
 }
 
 }  // namespace
@@ -877,6 +735,10 @@ auto build_fse_ctable(int table_log, const std::int16_t* norm, int max_symbol)
     FseCTable ct;
     ct.table_log = table_log;
     ct.table_size = 1 << table_log;
+    ct.present_mask = 0;
+    for (int s = 0; s <= max_symbol && s < 64; ++s) {
+        if (norm[s] != 0) ct.present_mask |= (1ULL << s);
+    }
     const int table_size = ct.table_size;
     const int table_mask = table_size - 1;
     const int step = (table_size >> 1) + (table_size >> 3) + 3;
@@ -969,30 +831,6 @@ auto build_fse_ctable(int table_log, const std::int16_t* norm, int max_symbol)
     return ct;
 }
 
-auto fse_init_cstate2(const FseCTable& ct, int symbol) -> std::uint32_t {
-    const std::uint32_t delta_nb_bits = ct.delta_nb_bits[symbol];
-    const std::uint32_t nb_bits_out = (delta_nb_bits + (1u << 15)) >> 16;
-    std::uint32_t value = (nb_bits_out << 16) - delta_nb_bits;
-    const int idx = static_cast<int>(value >> nb_bits_out) +
-                    ct.delta_find_state[symbol];
-    value = ct.state_table[static_cast<std::size_t>(idx)];
-    return value;
-}
-
-void fse_encode_symbol(FseBitWriter& w, const FseCTable& ct,
-                       std::uint32_t& value, int symbol) {
-    const std::uint32_t delta_nb_bits = ct.delta_nb_bits[symbol];
-    const std::uint32_t nb_bits_out = (value + delta_nb_bits) >> 16;
-    w.put_bits(value, static_cast<int>(nb_bits_out));
-    const int idx = static_cast<int>(value >> nb_bits_out) +
-                    ct.delta_find_state[symbol];
-    value = ct.state_table[static_cast<std::size_t>(idx)];
-}
-
-void fse_flush_cstate(FseBitWriter& w, const FseCTable& ct, std::uint32_t value) {
-    w.put_bits(value, ct.table_log);
-}
-
 // ==========================================================================
 // Shared FSE table helpers (NCount + normalization + decode table).
 // ==========================================================================
@@ -1016,7 +854,69 @@ struct FwdBits {
     void skip(int bits) { pos += static_cast<std::size_t>(bits); }
 };
 
+auto log2_lut() -> const double* {
+    static const auto tbl = [] {
+        std::array<double, 514> a{};
+        a[0] = 0.0;
+        for (int i = 1; i < 514; ++i) {
+            a[static_cast<std::size_t>(i)] = std::log2(static_cast<double>(i));
+        }
+        return a;
+    }();
+    return tbl.data();
 }
+
+void kl_adjust_norm(const unsigned* freqs, int max_symbol, int table_size,
+                    long long sum, std::vector<int>& norm) {
+    const double* l2 = log2_lut();
+    auto get_l2 = [l2](int n) -> double {
+        return (n < 514) ? l2[n] : std::log2(static_cast<double>(n));
+    };
+
+    while (sum > table_size) {
+        int best = -1;
+        double best_loss = 1e30;
+        for (int s = 0; s <= max_symbol; ++s) {
+            const int n = norm[static_cast<std::size_t>(s)];
+            if (n > 1) {
+                const double loss =
+                    static_cast<double>(freqs[s]) * (get_l2(n) - get_l2(n - 1));
+                if (best < 0 || loss < best_loss) {
+                    best_loss = loss;
+                    best = s;
+                }
+            }
+        }
+        if (best < 0) break;
+        norm[static_cast<std::size_t>(best)]--;
+        --sum;
+    }
+
+    while (sum < table_size) {
+        int best = -1;
+        double best_gain = -1.0;
+        for (int s = 0; s <= max_symbol; ++s) {
+            if (freqs[s] == 0) continue;
+            const int n = norm[static_cast<std::size_t>(s)];
+            const int cur_slots = (n == -1) ? 1 : n;
+            const double gain =
+                static_cast<double>(freqs[s]) * (get_l2(cur_slots + 1) - get_l2(cur_slots));
+            if (best < 0 || gain > best_gain) {
+                best_gain = gain;
+                best = s;
+            }
+        }
+        if (best < 0) break;
+        if (norm[static_cast<std::size_t>(best)] == -1) {
+            norm[static_cast<std::size_t>(best)] = 2;
+        } else {
+            norm[static_cast<std::size_t>(best)]++;
+        }
+        ++sum;
+    }
+}
+
+}  // namespace
 
 void fse_normalize(const unsigned* freqs, int total, int max_symbol,
                    int table_log, std::vector<int>& norm) {
@@ -1026,36 +926,38 @@ void fse_normalize(const unsigned* freqs, int total, int max_symbol,
     long long sum = 0;
     for (int s = 0; s <= max_symbol; ++s) {
         if (freqs[s] > 0) {
-            long long v = (static_cast<long long>(freqs[s]) * table_size) / total;
+            long long v =
+                (static_cast<long long>(freqs[s]) * table_size + (total / 2)) / total;
             if (v < 1) v = 1;
             norm[static_cast<std::size_t>(s)] = static_cast<int>(v);
             sum += v;
         }
     }
-    while (sum > table_size) {
-        int best = -1;
-        for (int s = 0; s <= max_symbol; ++s) {
-            if (norm[static_cast<std::size_t>(s)] > 1 &&
-                (best < 0 || norm[static_cast<std::size_t>(s)] >
-                                 norm[static_cast<std::size_t>(best)])) {
-                best = s;
-            }
+    kl_adjust_norm(freqs, max_symbol, table_size, sum, norm);
+}
+
+void fse_normalize_lowprob(const unsigned* freqs, int total, int max_symbol,
+                           int table_log, std::vector<int>& norm) {
+    const int table_size = 1 << table_log;
+    norm.assign(static_cast<std::size_t>(max_symbol) + 1, 0);
+    if (total <= 0) return;
+    const long long low_thresh = std::max(1, total >> (table_log + 1));
+    long long sum = 0;
+    for (int s = 0; s <= max_symbol; ++s) {
+        if (freqs[s] == 0) continue;
+        if (static_cast<long long>(freqs[s]) <= low_thresh) {
+            norm[static_cast<std::size_t>(s)] = -1;
+            sum += 1;
+        } else {
+            long long v =
+                (static_cast<long long>(freqs[s]) * table_size + (total / 2)) /
+                total;
+            if (v < 1) v = 1;
+            norm[static_cast<std::size_t>(s)] = static_cast<int>(v);
+            sum += v;
         }
-        if (best < 0) break;
-        norm[static_cast<std::size_t>(best)]--;
-        sum--;
     }
-    while (sum < table_size) {
-        int best = 0;
-        for (int s = 1; s <= max_symbol; ++s) {
-            if (norm[static_cast<std::size_t>(s)] >
-                norm[static_cast<std::size_t>(best)]) {
-                best = s;
-            }
-        }
-        norm[static_cast<std::size_t>(best)]++;
-        sum++;
-    }
+    kl_adjust_norm(freqs, max_symbol, table_size, sum, norm);
 }
 
 void fse_write_ncount(std::vector<std::byte>& out, const int* norm,

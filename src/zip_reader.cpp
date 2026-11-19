@@ -197,11 +197,10 @@ auto extract_entry_from(std::span<const std::byte> archive,
     std::span<const std::byte> comp_data{base + data_offset,
                                           entry.compressed_size};
 
-    // Decompress.
-    CompressedEntry ce;
-    ce.codec = entry.codec;
-    ce.data.assign(comp_data.begin(), comp_data.end());
-    auto result = decompress(ce);
+    // Decompress without extra copy of the compressed payload.
+    auto result = detail::decompress_span(
+        entry.codec, comp_data,
+        static_cast<std::size_t>(entry.uncompressed_size));
 
     // Verify CRC.
     auto actual_crc = crc32(std::span<const std::byte>{result.data(), result.size()});

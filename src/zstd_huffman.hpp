@@ -11,14 +11,22 @@
 
 namespace fzip::zstd {
 
+struct HufDecEntry {
+    std::uint8_t sym = 0;
+    std::uint8_t bits = 0;
+};
+
 struct HufTable {
     int table_log = 0;                 // maximum code length
     std::vector<int> lengths;          // per-symbol code length (0 = absent)
     std::vector<std::uint32_t> codes;  // canonical code per symbol (MSB-first)
+    std::vector<HufDecEntry> dtable;   // flat decode LUT (1 << table_log)
 };
 
 // Build a length-limited (<= max_bits) Huffman table from symbol frequencies.
 auto huf_build(const std::vector<std::uint32_t>& freqs, int max_bits) -> HufTable;
+auto huf_build_from_freqs(const std::uint32_t* freqs, int num_syms,
+                          int max_bits) -> HufTable;
 
 // Compress literal bytes into the body of a Compressed_Literals_Block:
 // weight table + jump table + 4 Huffman streams. Returns false if Huffman is
@@ -32,6 +40,9 @@ auto huf_compress_literals(const std::uint8_t* literals, int num_literals,
 // Returns false if there are fewer than two distinct symbols.
 auto huf_literals_table(const std::uint8_t* literals, int num_literals,
                         HufTable& t) -> bool;
+auto huf_literals_table_from_freqs(const std::uint32_t freqs[256],
+                                   HufTable& t) -> bool;
+auto huf_write_weights(const HufTable& t, std::vector<std::byte>& out) -> bool;
 
 // Body of a Compressed_Literals_Block for a precomputed table (weight table +
 // [jump table +] streams). Fails if the table cannot represent a literal or its

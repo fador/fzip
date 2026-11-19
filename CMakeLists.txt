@@ -19,10 +19,17 @@ option(FZIP_BUILD_GUI "Build the optional fzip-gui application" OFF)
 if(MSVC)
     add_compile_options(/W4 /WX /permissive- /Zc:__cplusplus /Zc:preprocessor
         /EHsc /utf-8 /nologo)
-    add_compile_options($<$<CONFIG:Release>:/Zi>)
-    add_link_options($<$<CONFIG:Release>:/DEBUG>)
+    add_compile_options(
+        $<$<CONFIG:Release>:/Zi>
+        $<$<CONFIG:Release>:/Oi>
+        $<$<CONFIG:Release>:/Ot>
+        $<$<CONFIG:Release>:/GL>)
+    add_link_options(
+        $<$<CONFIG:Release>:/DEBUG>
+        $<$<CONFIG:Release>:/LTCG>)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+    add_compile_options($<$<CONFIG:Release>:-O3>)
 endif()
 
 if(NOT CMAKE_RUNTIME_LIBRARY_DIRECTORY)

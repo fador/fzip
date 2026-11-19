@@ -1,6 +1,7 @@
 // fzip — zstd sequence decoder implementation (RFC 8878 §4.2.2).
 #include "zstd_sequence.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -161,17 +162,20 @@ auto decode_sequences(const std::byte* data, std::size_t size,
 void execute_sequences(const std::vector<Sequence>& sequences,
                        const std::vector<std::byte>& literals,
                        std::vector<std::byte>& out) {
-    int lit_pos = 0;
+    std::size_t lit_pos = 0;
+    const std::size_t lit_size = literals.size();
 
     for (const auto& seq : sequences) {
         // Copy literal bytes.
         if (seq.literals_length > 0) {
-            if (lit_pos + seq.literals_length > static_cast<int>(literals.size())) {
+            const std::size_t ll = static_cast<std::size_t>(seq.literals_length);
+            if (lit_pos + ll > lit_size) {
                 throw ZstdError("literals overflow in sequence execution");
             }
-            out.insert(out.end(), literals.begin() + lit_pos,
-                       literals.begin() + lit_pos + seq.literals_length);
-            lit_pos += seq.literals_length;
+            const std::size_t old = out.size();
+            out.resize(old + ll);
+            std::memcpy(out.data() + old, literals.data() + lit_pos, ll);
+            lit_pos += ll;
         }
 
         // Copy match bytes.
@@ -184,17 +188,34 @@ void execute_sequences(const std::vector<Sequence>& sequences,
                 throw ZstdError("invalid match length: " + std::to_string(seq.match_length));
             }
 
-            std::size_t src = out.size() - static_cast<std::size_t>(offset);
-            for (int j = 0; j < seq.match_length; ++j) {
-                out.push_back(out[src + static_cast<std::size_t>(j)]);
+            const std::size_t dist = static_cast<std::size_t>(offset);
+            const std::size_t ml = static_cast<std::size_t>(seq.match_length);
+            const std::size_t old = out.size();
+            out.resize(old + ml);
+            std::byte* dst = out.data() + old;
+            if (dist >= ml) {
+                std::memcpy(dst, dst - dist, ml);
+            } else if (dist == 1) {
+                std::memset(dst, static_cast<int>(static_cast<unsigned char>(*(dst - 1))), ml);
+            } else {
+                std::size_t copied = dist;
+                std::memcpy(dst, dst - dist, dist);
+                while (copied < ml) {
+                    const std::size_t chunk = std::min(copied, ml - copied);
+                    std::memcpy(dst + copied, dst, chunk);
+                    copied += chunk;
+                }
             }
         }
     }
 
     // Literals remaining after the last sequence are appended verbatim
     // (RFC 8878 §4.2.5, "Sequence Execution").
-    if (lit_pos < static_cast<int>(literals.size())) {
-        out.insert(out.end(), literals.begin() + lit_pos, literals.end());
+    if (lit_pos < lit_size) {
+        const std::size_t rem = lit_size - lit_pos;
+        const std::size_t old = out.size();
+        out.resize(old + rem);
+        std::memcpy(out.data() + old, literals.data() + lit_pos, rem);
     }
 }
 

@@ -2,8 +2,14 @@
 // FSE is a variant of tANS used for all sequence symbols in zstd.
 #pragma once
 
+#include <algorithm>
+#include <bit>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
+
+#include "zstd_internal.hpp"
 
 namespace fzip::zstd {
 
@@ -41,38 +47,120 @@ auto build_fse_table(int accuracy_log, const int* norm_counts, int max_symbol)
 // contains a 1-bit sentinel followed by zero-padding.
 class FseBitReader {
   public:
-    // `data` points to the END of the FSE bitstream (i.e. the last byte
-    // written). `size` is the number of bytes in the bitstream.
-    explicit FseBitReader(const std::byte* data, std::size_t size);
+    // `data` points to the start of the FSE bitstream; `size` is the number of
+    // bytes in the bitstream.
+    explicit FseBitReader(const std::byte* data, std::size_t size)
+        : data_(reinterpret_cast<const std::uint8_t*>(data)),
+          total_bits_(size * 8),
+          pos_(0) {
+        if (size == 0) {
+            bits_consumed_ = 64;
+            return;
+        }
+        std::size_t idx = size;
+        while (idx > 0) {
+            --idx;
+            const std::uint8_t byte = data_[idx];
+            if (byte != 0) {
+                const int lead = std::countl_zero(byte);
+                pos_ = (size - 1 - idx) * 8 + static_cast<std::size_t>(lead) + 1;
+                ptr_ = idx + 1;
+                load_container();
+                bits_consumed_ = lead + 1;
+                return;
+            }
+        }
+        ptr_ = size;
+        load_container();
+        bits_consumed_ = 0;
+    }
 
-    // Read `n` bits (1-24) from the reverse bitstream.
-    auto read_bits(int n) -> std::uint32_t;
+    // Read `n` bits (0-28) from the reverse bitstream.
+    auto read_bits(int n) -> std::uint32_t {
+        if (n <= 0) return 0;
+        if (pos_ + static_cast<std::size_t>(n) > total_bits_) {
+            throw ZstdError("fse bitreader: underflow");
+        }
+        const std::uint32_t v = peek_bits(n);
+        pos_ += static_cast<std::size_t>(n);
+        bits_consumed_ += n;
+        return v;
+    }
 
     // Read `n` bits without advancing. Bits past the start of the stream read
-    // as 0 (used by the Huffman decoder, whose table lookup only depends on
-    // the leading bits of the peeked value).
-    auto peek_bits(int n) -> std::uint32_t;
+    // as 0.
+    auto peek_bits(int n) -> std::uint32_t {
+        if (n <= 0) return 0;
+        if (bits_consumed_ + n > 64 && ptr_ > 8) reload();
+        if (bits_consumed_ >= 64) return 0;
+        return static_cast<std::uint32_t>(
+            (bit_container_ << bits_consumed_) >> (64 - n));
+    }
 
     // Like read_bits, but bits past the start of the stream read as 0 instead
     // of throwing (used by the FSE weight decoder).
-    auto read_bits_padded(int n) -> std::uint32_t;
+    auto read_bits_padded(int n) -> std::uint32_t {
+        if (n <= 0) return 0;
+        const std::uint32_t v = peek_bits(n);
+        pos_ += static_cast<std::size_t>(n);
+        bits_consumed_ += n;
+        return v;
+    }
 
     // Skip `n` bits without reading.
-    void skip_bits(int n) { pos_ += static_cast<std::size_t>(n); }
+    void skip_bits(int n) {
+        pos_ += static_cast<std::size_t>(n);
+        bits_consumed_ += n;
+        if (bits_consumed_ >= 32 && ptr_ > 8) reload();
+    }
 
     // Current bit position (counted from the end of the stream).
     auto bit_pos() const -> std::size_t { return pos_; }
 
     // Get the current FSE state (initial state = first `accuracy_log` bits).
-    auto get_state(int accuracy_log) -> std::uint32_t;
+    auto get_state(int accuracy_log) -> std::uint32_t {
+        return read_bits(accuracy_log);
+    }
 
     // Check if we've consumed all bits.
-    auto empty() const -> bool;
+    auto empty() const -> bool { return pos_ >= total_bits_; }
 
   private:
-    const std::byte* data_;  // points to end of stream
-    std::size_t size_;       // total bytes
-    std::size_t pos_;        // current bit position (counting from end backward)
+    void load_container() {
+        if (ptr_ >= 8) {
+            if constexpr (std::endian::native == std::endian::little) {
+                std::memcpy(&bit_container_, data_ + ptr_ - 8, 8);
+            } else {
+                bit_container_ = 0;
+                for (int i = 0; i < 8; ++i) {
+                    bit_container_ |=
+                        static_cast<std::uint64_t>(data_[ptr_ - 8 + i]) << (i * 8);
+                }
+            }
+        } else {
+            bit_container_ = 0;
+            for (std::size_t i = 0; i < ptr_; ++i) {
+                bit_container_ |=
+                    static_cast<std::uint64_t>(data_[i]) << ((8 - ptr_ + i) * 8);
+            }
+        }
+    }
+
+    void reload() {
+        if (ptr_ <= 8 || bits_consumed_ < 8) return;
+        const std::size_t bytes = static_cast<std::size_t>(bits_consumed_ >> 3);
+        const std::size_t step = std::min(bytes, ptr_ - 8);
+        ptr_ -= step;
+        bits_consumed_ -= static_cast<int>(step << 3);
+        load_container();
+    }
+
+    const std::uint8_t* data_;
+    std::size_t total_bits_;
+    std::size_t pos_;
+    std::size_t ptr_ = 0;
+    std::uint64_t bit_container_ = 0;
+    int bits_consumed_ = 0;
 };
 
 // Decode one FSE symbol: read from state table, update state via bitstream.
@@ -101,21 +189,59 @@ auto predefined_matchlen_norm() -> const int*;
 
 // --- Encoder API ---
 
-// Forward-direction bitstream writer (LSB-first).
+// Forward-direction bitstream writer (LSB-first, 64-bit accumulator).
 class FseBitWriter {
   public:
-    void put_bits(std::uint32_t value, int n);
-    void put_bit(bool bit);
-    void align_to_byte();
-    void put_byte(std::uint8_t byte);
-    auto data() const -> const std::vector<std::byte>&;
-    auto size() const -> std::size_t;
-    auto bit_count() const -> std::size_t;
-    void clear();
+    void reserve(std::size_t bytes) { out_.reserve(bytes); }
+
+    void put_bits(std::uint32_t value, int n) {
+        acc_ |= (static_cast<std::uint64_t>(value) & ((1ULL << n) - 1ULL)) << acc_bits_;
+        acc_bits_ += n;
+        if (acc_bits_ >= 32) {
+            const std::size_t pos = out_.size();
+            out_.resize(pos + 4);
+            const std::uint32_t lo = static_cast<std::uint32_t>(acc_ & 0xFFFFFFFFULL);
+            if constexpr (std::endian::native == std::endian::little) {
+                std::memcpy(out_.data() + pos, &lo, 4);
+            } else {
+                out_[pos]     = static_cast<std::byte>(lo & 0xFFu);
+                out_[pos + 1] = static_cast<std::byte>((lo >> 8) & 0xFFu);
+                out_[pos + 2] = static_cast<std::byte>((lo >> 16) & 0xFFu);
+                out_[pos + 3] = static_cast<std::byte>((lo >> 24) & 0xFFu);
+            }
+            acc_ >>= 32;
+            acc_bits_ -= 32;
+        }
+    }
+
+    void put_bit(bool bit) { put_bits(bit ? 1u : 0u, 1); }
+
+    void align_to_byte() {
+        while (acc_bits_ > 0) {
+            out_.push_back(static_cast<std::byte>(acc_ & 0xFFu));
+            acc_ >>= 8;
+            acc_bits_ -= 8;
+        }
+        acc_ = 0;
+        acc_bits_ = 0;
+    }
+
+    void put_byte(std::uint8_t byte) { out_.push_back(static_cast<std::byte>(byte)); }
+    auto data() const -> const std::vector<std::byte>& { return out_; }
+    auto take_data() -> std::vector<std::byte> { return std::move(out_); }
+    auto size() const -> std::size_t { return out_.size(); }
+    auto bit_count() const -> std::size_t {
+        return out_.size() * 8 + static_cast<std::size_t>(acc_bits_);
+    }
+    void clear() {
+        out_.clear();
+        acc_ = 0;
+        acc_bits_ = 0;
+    }
 
   private:
     std::vector<std::byte> out_;
-    std::uint32_t acc_ = 0;
+    std::uint64_t acc_ = 0;
     int acc_bits_ = 0;
 };
 
@@ -169,6 +295,7 @@ void write_fse_table_description(FseBitWriter& writer, int accuracy_log,
 struct FseCTable {
     int table_log = 0;
     int table_size = 0;
+    std::uint64_t present_mask = 0;              // bit s set iff sym s (0..63) is present
     std::vector<std::uint16_t> state_table;      // size = table_size
     std::vector<std::int32_t> delta_find_state;  // per symbol
     std::vector<std::uint32_t> delta_nb_bits;    // per symbol
@@ -181,15 +308,31 @@ auto build_fse_ctable(int table_log, const std::int16_t* norm, int max_symbol)
 
 // FSE_initCState2: initialize a state with `symbol` (the first symbol the
 // encoder emits, which is the last one the decoder reads).
-auto fse_init_cstate2(const FseCTable& ct, int symbol) -> std::uint32_t;
+inline auto fse_init_cstate2(const FseCTable& ct, int symbol) -> std::uint32_t {
+    const std::uint32_t delta_nb_bits = ct.delta_nb_bits[static_cast<std::size_t>(symbol)];
+    const std::uint32_t nb_bits_out = (delta_nb_bits + (1u << 15)) >> 16;
+    std::uint32_t value = (nb_bits_out << 16) - delta_nb_bits;
+    const int idx = static_cast<int>(value >> nb_bits_out) +
+                    ct.delta_find_state[static_cast<std::size_t>(symbol)];
+    return ct.state_table[static_cast<std::size_t>(idx)];
+}
 
 // FSE_encodeSymbol: emit `symbol` from `value` and advance the state.
-void fse_encode_symbol(FseBitWriter& w, const FseCTable& ct,
-                       std::uint32_t& value, int symbol);
+inline void fse_encode_symbol(FseBitWriter& w, const FseCTable& ct,
+                              std::uint32_t& value, int symbol) {
+    const std::uint32_t delta_nb_bits = ct.delta_nb_bits[static_cast<std::size_t>(symbol)];
+    const std::uint32_t nb_bits_out = (value + delta_nb_bits) >> 16;
+    w.put_bits(value, static_cast<int>(nb_bits_out));
+    const int idx = static_cast<int>(value >> nb_bits_out) +
+                    ct.delta_find_state[static_cast<std::size_t>(symbol)];
+    value = ct.state_table[static_cast<std::size_t>(idx)];
+}
 
 // FSE_flushCState: emit the final state (the decoder's initial state).
-void fse_flush_cstate(FseBitWriter& w, const FseCTable& ct,
-                      std::uint32_t value);
+inline void fse_flush_cstate(FseBitWriter& w, const FseCTable& ct,
+                             std::uint32_t value) {
+    w.put_bits(value, ct.table_log);
+}
 
 // --- Shared FSE table helpers (NCount + normalization + decode table) ---
 
@@ -198,6 +341,10 @@ void fse_flush_cstate(FseBitWriter& w, const FseCTable& ct,
 // entries (useLowProbCount = 0, as zstd uses for Huffman weights).
 void fse_normalize(const unsigned* freqs, int total, int max_symbol,
                    int table_log, std::vector<int>& norm);
+
+// Variant that assigns -1 ("less than 1" probability) to rare symbols.
+void fse_normalize_lowprob(const unsigned* freqs, int total, int max_symbol,
+                           int table_log, std::vector<int>& norm);
 
 // Write/read an FSE table description (FSE_writeNCount / FSE_readNCount).
 void fse_write_ncount(std::vector<std::byte>& out, const int* norm,

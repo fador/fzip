@@ -2,6 +2,7 @@
 #include "zstd_huffman.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
 
 #include "zstd_fse.hpp"
@@ -11,18 +12,14 @@ namespace fzip::zstd {
 
 namespace {
 
-auto highbit_u32(std::uint32_t x) -> int {
-    int r = 0;
-    while (x > 1) { x >>= 1; ++r; }
-    return r;
+inline auto highbit_u32(std::uint32_t x) -> int {
+    return std::bit_width(x) - 1;
 }
 
 // Length-limited prefix code lengths via package-merge (Larmore-Hirschberg),
-// ported from Stephan Brumme's public-domain implementation. `A` must be a
-// histogram sorted ascending with no zeros; on return it holds code lengths.
-auto package_merge_sorted(int max_length, std::vector<std::uint64_t>& A) -> int {
-    int num_codes = static_cast<int>(A.size());
-    if (num_codes == 0 || max_length == 0) return 0;
+// stack-allocated (num_codes <= 256). `A` must be sorted ascending with no zeros.
+auto package_merge_sorted(int max_length, int num_codes, std::uint64_t* A) -> int {
+    if (num_codes <= 0 || max_length == 0) return 0;
     if (num_codes <= 2) {
         A[0] = 1;
         if (num_codes == 2) A[1] = 1;
@@ -31,16 +28,17 @@ auto package_merge_sorted(int max_length, std::vector<std::uint64_t>& A) -> int 
     if (max_length > 63) return 0;
     if ((1ULL << max_length) < static_cast<std::uint64_t>(num_codes)) return 0;
 
-    using BitMask = std::uint64_t;
-    const int max_buffer = 2 * num_codes;
-    std::vector<std::uint64_t> current(static_cast<std::size_t>(max_buffer));
-    std::vector<std::uint64_t> previous(static_cast<std::size_t>(max_buffer));
-    std::vector<BitMask> is_merged(static_cast<std::size_t>(max_buffer), 0);
+    constexpr int kMaxBuf = 512;
+    std::uint64_t buf_a[kMaxBuf];
+    std::uint64_t buf_b[kMaxBuf];
+    std::uint64_t is_merged[kMaxBuf]{};
+    std::uint64_t* current = buf_a;
+    std::uint64_t* previous = buf_b;
     for (int i = 0; i < num_codes; ++i) previous[i] = A[i];
     int num_previous = num_codes;
     const int num_relevant = 2 * num_codes - 2;
 
-    BitMask mask = 1;
+    std::uint64_t mask = 1;
     for (int bits = max_length - 1; bits > 0; --bits) {
         num_previous &= ~1;
         current[0] = A[0];
@@ -76,7 +74,7 @@ auto package_merge_sorted(int max_length, std::vector<std::uint64_t>& A) -> int 
     }
     mask >>= 1;
 
-    std::vector<unsigned int> code_lengths(static_cast<std::size_t>(num_codes), 0);
+    unsigned int code_lengths[256]{};
     int num_analyze = num_relevant;
     while (mask != 0) {
         int num_merged = 0;
@@ -95,7 +93,7 @@ auto package_merge_sorted(int max_length, std::vector<std::uint64_t>& A) -> int 
         mask >>= 1;
     }
     for (int i = 0; i < num_analyze; ++i) code_lengths[i]++;
-    for (int i = 0; i < num_codes; ++i) A[i] = code_lengths[static_cast<std::size_t>(i)];
+    for (int i = 0; i < num_codes; ++i) A[i] = code_lengths[i];
     return static_cast<int>(code_lengths[0]);
 }
 
@@ -183,8 +181,9 @@ auto write_weights(const HufTable& t, std::vector<std::byte>& out) -> bool {
 void encode_stream(const HufTable& t, const std::uint8_t* literals,
                    int n, std::vector<std::byte>& out) {
     FseBitWriter w;
+    w.reserve(static_cast<std::size_t>(n) + 8);
     for (int i = n - 1; i >= 0; --i) {
-        std::uint8_t lit = literals[i];
+        const std::uint8_t lit = literals[i];
         w.put_bits(t.codes[lit], t.lengths[lit]);
     }
     w.put_bit(true);
@@ -193,31 +192,35 @@ void encode_stream(const HufTable& t, const std::uint8_t* literals,
     out.insert(out.end(), bytes.begin(), bytes.end());
 }
 
-// Decode one Huffman stream into `n` literals.
-void decode_stream(const HufTable& t, const std::byte* data, std::size_t size,
-                   int n, std::vector<std::byte>& out) {
+void build_huf_dtable(const HufTable& t, std::vector<HufDecEntry>& dt) {
     const int dt_log = t.table_log;
     if (dt_log <= 0) throw ZstdError("empty Huffman table");
-    struct Entry {
-        std::uint8_t sym;
-        std::uint8_t bits;
-    };
-    std::vector<Entry> dt(static_cast<std::size_t>(1) << dt_log);
+    dt.resize(static_cast<std::size_t>(1) << dt_log);
     for (std::size_t s = 0; s < t.lengths.size(); ++s) {
-        int l = t.lengths[s];
+        const int l = t.lengths[s];
         if (l == 0) continue;
-        std::uint32_t base = t.codes[s] << (dt_log - l);
-        std::uint32_t count = 1u << (dt_log - l);
+        const std::uint32_t base = t.codes[s] << (dt_log - l);
+        const std::uint32_t count = 1u << (dt_log - l);
+        const HufDecEntry entry{static_cast<std::uint8_t>(s),
+                                static_cast<std::uint8_t>(l)};
         for (std::uint32_t i = 0; i < count; ++i) {
-            dt[base + i].sym = static_cast<std::uint8_t>(s);
-            dt[base + i].bits = static_cast<std::uint8_t>(l);
+            dt[base + i] = entry;
         }
     }
+}
+
+// Decode one Huffman stream into `n` literals using prebuilt `dt`.
+void decode_stream(int dt_log, const HufDecEntry* dt, const std::byte* data,
+                   std::size_t size, int n, std::vector<std::byte>& out) {
     FseBitReader r(data, size);
+    const std::size_t base_out = out.size();
+    out.resize(base_out + static_cast<std::size_t>(n));
+    std::byte* dst = out.data() + base_out;
     for (int i = 0; i < n; ++i) {
-        std::uint32_t idx = r.peek_bits(dt_log);
-        out.push_back(static_cast<std::byte>(dt[idx].sym));
-        r.skip_bits(dt[idx].bits);
+        const std::uint32_t idx = r.peek_bits(dt_log);
+        const HufDecEntry e = dt[idx];
+        dst[i] = static_cast<std::byte>(e.sym);
+        r.skip_bits(e.bits);
     }
 }
 
@@ -360,29 +363,30 @@ auto fse_decompress_weights(const std::byte* data, std::size_t size,
 
 }  // namespace
 
-auto huf_build(const std::vector<std::uint32_t>& freqs, int max_bits)
-    -> HufTable {
+auto huf_build_from_freqs(const std::uint32_t* freqs, int num_syms,
+                          int max_bits) -> HufTable {
     HufTable t;
-    t.lengths.assign(freqs.size(), 0);
+    t.lengths.assign(static_cast<std::size_t>(num_syms), 0);
     struct Sym {
         std::uint64_t f;
         int s;
     };
-    std::vector<Sym> syms;
-    for (int s = 0; s < static_cast<int>(freqs.size()); ++s) {
-        if (freqs[static_cast<std::size_t>(s)] > 0) {
-            syms.push_back({freqs[static_cast<std::size_t>(s)], s});
+    Sym syms[256];
+    int n_present = 0;
+    for (int s = 0; s < num_syms && s < 256; ++s) {
+        if (freqs[s] > 0) {
+            syms[n_present++] = {freqs[s], s};
         }
     }
-    if (syms.size() < 2) return t;
-    std::sort(syms.begin(), syms.end(), [](const Sym& a, const Sym& b) {
+    if (n_present < 2) return t;
+    std::sort(syms, syms + n_present, [](const Sym& a, const Sym& b) {
         if (a.f != b.f) return a.f < b.f;
         return a.s < b.s;
     });
-    std::vector<std::uint64_t> hist(syms.size());
-    for (std::size_t i = 0; i < syms.size(); ++i) hist[i] = syms[i].f;
-    package_merge_sorted(max_bits, hist);
-    for (std::size_t i = 0; i < syms.size(); ++i) {
+    std::uint64_t hist[256];
+    for (int i = 0; i < n_present; ++i) hist[i] = syms[i].f;
+    package_merge_sorted(max_bits, n_present, hist);
+    for (int i = 0; i < n_present; ++i) {
         t.lengths[static_cast<std::size_t>(syms[i].s)] =
             static_cast<int>(hist[i]);
     }
@@ -390,13 +394,28 @@ auto huf_build(const std::vector<std::uint32_t>& freqs, int max_bits)
     return t;
 }
 
+auto huf_build(const std::vector<std::uint32_t>& freqs, int max_bits)
+    -> HufTable {
+    return huf_build_from_freqs(freqs.data(), static_cast<int>(freqs.size()),
+                                max_bits);
+}
+
+auto huf_literals_table_from_freqs(const std::uint32_t freqs[256],
+                                   HufTable& t) -> bool {
+    t = huf_build_from_freqs(freqs, 256, 11);
+    return t.table_log != 0;
+}
+
 auto huf_literals_table(const std::uint8_t* literals, int num_literals,
                         HufTable& t) -> bool {
     if (num_literals < 2) return false;
-    std::vector<std::uint32_t> freqs(256, 0);
+    std::uint32_t freqs[256]{};
     for (int i = 0; i < num_literals; ++i) freqs[literals[i]]++;
-    t = huf_build(freqs, 11);
-    return t.table_log != 0;
+    return huf_literals_table_from_freqs(freqs, t);
+}
+
+auto huf_write_weights(const HufTable& t, std::vector<std::byte>& out) -> bool {
+    return write_weights(t, out);
 }
 
 auto huf_encode_streams(const HufTable& t, const std::uint8_t* literals,
@@ -512,6 +531,7 @@ auto huf_read_weights(const std::byte* data, std::size_t size, HufTable& t,
             w > 0 ? (table_log + 1 - w) : 0;
     }
     finalize_codes(t);
+    build_huf_dtable(t, t.dtable);
     return true;
 }
 
@@ -521,10 +541,18 @@ auto huf_decode_streams(const HufTable& t, const std::byte* streams,
     std::vector<std::byte> out;
     out.reserve(static_cast<std::size_t>(num_literals));
     if (num_literals == 0) return out;
+    if (t.table_log <= 0) throw ZstdError("empty Huffman table");
+
+    std::vector<HufDecEntry> local_dt;
+    const HufDecEntry* dt = t.dtable.data();
+    if (t.dtable.empty()) {
+        build_huf_dtable(t, local_dt);
+        dt = local_dt.data();
+    }
 
     if (size_format == 0) {
         // Single stream.
-        decode_stream(t, streams, body_size, num_literals, out);
+        decode_stream(t.table_log, dt, streams, body_size, num_literals, out);
         return out;
     }
 
@@ -545,7 +573,7 @@ auto huf_decode_streams(const HufTable& t, const std::byte* streams,
     const std::byte* p = streams + 6;
     for (int i = 0; i < 4; ++i) {
         if (targets[i] > 0) {
-            decode_stream(t, p, sizes[i], targets[i], out);
+            decode_stream(t.table_log, dt, p, sizes[i], targets[i], out);
         }
         p += sizes[i];
     }
