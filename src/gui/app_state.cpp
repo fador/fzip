@@ -108,6 +108,44 @@ auto styled_button(const char* label, const ImVec2& size,
     return clicked;
 }
 
+void draw_brand_badge(float size, bool extract_accent = false) {
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(size, size));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p1(p0.x + size, p0.y + size);
+    const float r = size * 0.22f;
+    const ImU32 bg_col = extract_accent ? IM_COL32(14, 34, 32, 255) : IM_COL32(16, 24, 38, 255);
+    const ImU32 bd_col = extract_accent ? IM_COL32(32, 201, 151, 255) : IM_COL32(88, 166, 255, 255);
+    const ImU32 zip_col = extract_accent ? IM_COL32(16, 185, 129, 255) : IM_COL32(188, 140, 255, 255);
+
+    dl->AddRectFilled(p0, p1, bg_col, r);
+    dl->AddRect(p0, p1, bd_col, r, 0, std::max(1.5f, size * 0.08f));
+
+    // Zipper track + teeth
+    const float zx = p0.x + size * 0.34f;
+    dl->AddLine(ImVec2(zx, p0.y + size * 0.18f), ImVec2(zx, p0.y + size * 0.82f),
+                IM_COL32(95, 118, 150, 255), std::max(1.5f, size * 0.07f));
+    for (int k = 0; k < 3; ++k) {
+        const float ty = p0.y + size * (0.24f + 0.14f * static_cast<float>(k));
+        const float ox = (k % 2 == 0) ? -size * 0.14f : size * 0.02f;
+        dl->AddRectFilled(ImVec2(zx + ox, ty),
+                          ImVec2(zx + ox + size * 0.12f, ty + size * 0.07f),
+                          IM_COL32(205, 222, 242, 255), 1.0f);
+    }
+    // Zipper slider pull tab
+    dl->AddRectFilled(ImVec2(zx - size * 0.11f, p0.y + size * 0.62f),
+                      ImVec2(zx + size * 0.11f, p0.y + size * 0.82f),
+                      zip_col, 2.0f);
+
+    // Accent bar on right side
+    dl->AddRectFilled(ImVec2(p0.x + size * 0.60f, p0.y + size * 0.30f),
+                      ImVec2(p0.x + size * 0.80f, p0.y + size * 0.42f),
+                      bd_col, 1.5f);
+    dl->AddRectFilled(ImVec2(p0.x + size * 0.60f, p0.y + size * 0.50f),
+                      ImVec2(p0.x + size * 0.74f, p0.y + size * 0.62f),
+                      zip_col, 1.5f);
+}
+
 void render_metric_card(const char* label, const std::string& value, const ImVec4& val_color) {
     ImGui::TextColored(ImVec4(0.56f, 0.62f, 0.71f, 1.00f), "%s", label);
     ImGui::TextColored(val_color, "%s", value.c_str());
@@ -598,6 +636,8 @@ void AppState::render_header_bar() {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.067f, 0.086f, 0.118f, 1.00f));
     if (ImGui::BeginChild("HeaderBar", ImVec2(0, h), ImGuiChildFlags_Borders,
                           ImGuiWindowFlags_NoScrollbar)) {
+        draw_brand_badge(26.0f * ui_scale_, mode_ == AppMode::Inspect);
+        ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
         if (bold_font_) ImGui::PushFont(bold_font_);
         ImGui::TextColored(ImVec4(0.35f, 0.65f, 1.00f, 1.00f), "FZIP");
@@ -1160,8 +1200,11 @@ void AppState::render_quick_progress_view() {
             const bool extracting = is_extract_op_.load();
             const bool failed = operation_failed_.load();
 
+            draw_brand_badge(24.0f * ui_scale_, extracting);
+            ImGui::SameLine();
             if (bold_font_) ImGui::PushFont(bold_font_);
-            ImGui::TextColored(ImVec4(0.35f, 0.65f, 1.00f, 1.00f),
+            ImGui::TextColored(extracting ? ImVec4(0.28f, 0.88f, 0.62f, 1.00f)
+                                          : ImVec4(0.35f, 0.65f, 1.00f, 1.00f),
                                extracting ? "FZIP  |  Extracting Archive"
                                           : "FZIP  |  Compressing Archive");
             if (bold_font_) ImGui::PopFont();

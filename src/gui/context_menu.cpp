@@ -84,6 +84,9 @@ auto check_context_menu_status() -> ContextMenuStatus {
 auto register_context_menu(const std::string& exe_path) -> bool {
     std::wstring wexe = to_wide(exe_path);
     std::wstring quote_exe = L"\"" + wexe + L"\"";
+    std::wstring icon_app = quote_exe + L",0";
+    std::wstring icon_compress = quote_exe + L",1";
+    std::wstring icon_extract = quote_exe + L",2";
 
     bool ok = true;
 
@@ -93,19 +96,19 @@ auto register_context_menu(const std::string& exe_path) -> bool {
              L"Software\\Classes\\Directory\\shell",
          }) {
         ok &= register_verb(root, L"fzip.compress", L"Compress with fzip...",
-                            quote_exe, quote_exe + L" --compress-dialog \"%1\"");
+                            icon_compress, quote_exe + L" --compress-dialog \"%1\"");
         ok &= register_verb(root, L"fzip.quick", L"Quick Compress to .zip (fzip)",
-                            quote_exe, quote_exe + L" --quick-compress \"%1\"");
+                            icon_compress, quote_exe + L" --quick-compress \"%1\"");
     }
 
     // 2. .zip archives across all Explorer association lookup paths
     for (const wchar_t* zip_base : kZipShellRoots) {
         ok &= register_verb(zip_base, L"fzip.extract_here", L"Extract Here (fzip)",
-                            quote_exe, quote_exe + L" --extract-here \"%1\"");
+                            icon_extract, quote_exe + L" --extract-here \"%1\"");
         ok &= register_verb(zip_base, L"fzip.extract_sub", L"Extract to folder... (fzip)",
-                            quote_exe, quote_exe + L" --extract-subdir \"%1\"");
+                            icon_extract, quote_exe + L" --extract-subdir \"%1\"");
         ok &= register_verb(zip_base, L"fzip.inspect", L"Open with fzip",
-                            quote_exe, quote_exe + L" \"%1\"");
+                            icon_app, quote_exe + L" \"%1\"");
     }
 
     return ok;

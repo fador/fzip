@@ -1,4 +1,5 @@
 #include "app_state.hpp"
+#include "resource.hpp"
 
 #include <imgui.h>
 
@@ -209,11 +210,18 @@ int main(int argc, char** argv) {
 
     ImGui_ImplWin32_EnableDpiAwareness();
 
+    HICON hIconBig = static_cast<HICON>(::LoadImageW(
+        hInstance, MAKEINTRESOURCEW(IDI_FZIP_APP), IMAGE_ICON,
+        ::GetSystemMetrics(SM_CXICON), ::GetSystemMetrics(SM_CYICON), LR_DEFAULTCOLOR));
+    HICON hIconSmall = static_cast<HICON>(::LoadImageW(
+        hInstance, MAKEINTRESOURCEW(IDI_FZIP_APP), IMAGE_ICON,
+        ::GetSystemMetrics(SM_CXSMICON), ::GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+
     // Register Win32 window class
     WNDCLASSEXW wc = {
         sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
-        hInstance, nullptr, nullptr, nullptr, nullptr,
-        L"fzip_gui_wndclass", nullptr
+        hInstance, hIconBig, nullptr, nullptr, nullptr,
+        L"fzip_gui_wndclass", hIconSmall
     };
     ::RegisterClassExW(&wc);
 
@@ -234,6 +242,12 @@ int main(int argc, char** argv) {
     HWND hwnd = ::CreateWindowW(wc.lpszClassName, wnd_title,
                                 wnd_style, x0, y0, base_w, base_h,
                                 nullptr, nullptr, wc.hInstance, nullptr);
+    if (hIconBig) {
+        ::SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hIconBig));
+    }
+    if (hIconSmall) {
+        ::SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hIconSmall));
+    }
 
     const UINT dpi = ::GetDpiForWindow(hwnd);
     const float dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;

@@ -61,6 +61,9 @@ target_link_libraries(fzip_core PUBLIC Threads::Threads)
 
 # --- fzip CLI ----------------------------------------------------------------
 add_executable(fzip src/main.cpp)
+if(WIN32)
+    target_sources(fzip PRIVATE src/gui/fzip_gui.rc)
+endif()
 target_link_libraries(fzip PRIVATE fzip_core)
 target_compile_features(fzip PRIVATE cxx_std_20)
 
@@ -111,6 +114,7 @@ if(FZIP_BUILD_GUI)
     target_link_libraries(fzip-gui PRIVATE fzip_core imgui_lib)
 
     if(WIN32)
+        target_sources(fzip-gui PRIVATE src/gui/fzip_gui.rc)
         set_target_properties(fzip-gui PROPERTIES WIN32_EXECUTABLE TRUE)
         target_compile_definitions(fzip-gui PRIVATE FZIP_GUI_WINMAIN NOMINMAX)
         target_link_libraries(fzip-gui PRIVATE d3d11 dxgi d3dcompiler ole32 uuid shell32 advapi32 comdlg32 dwmapi)

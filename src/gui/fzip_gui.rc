@@ -1,0 +1,5 @@
+#include "resource.hpp"
+
+IDI_FZIP_APP      ICON "../../assets/fzip_app.ico"
+IDI_FZIP_COMPRESS ICON "../../assets/fzip_compress.ico"
+IDI_FZIP_EXTRACT  ICON "../../assets/fzip_extract.ico"

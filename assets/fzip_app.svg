@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#182338"/>
+    </linearGradient>
+    <linearGradient id="bd" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#58a6ff"/>
+      <stop offset="100%" stop-color="#bc8cff"/>
+    </linearGradient>
+  </defs>
+  <rect x="14" y="14" width="228" height="228" rx="48" fill="url(#bg)" stroke="url(#bd)" stroke-width="14"/>
+  <rect x="64" y="34" width="10" height="184" rx="4" fill="#2a3648"/>
+  <rect x="50" y="42" width="20" height="10" rx="3" fill="#b9cae0"/>
+  <rect x="66" y="63" width="20" height="10" rx="3" fill="#889cb8"/>
+  <rect x="50" y="84" width="20" height="10" rx="3" fill="#b9cae0"/>
+  <rect x="66" y="105" width="20" height="10" rx="3" fill="#889cb8"/>
+  <rect x="50" y="126" width="20" height="10" rx="3" fill="#b9cae0"/>
+  <rect x="66" y="147" width="20" height="10" rx="3" fill="#889cb8"/>
+  <rect x="50" y="168" width="20" height="10" rx="3" fill="#b9cae0"/>
+  <rect x="49" y="160" width="40" height="34" rx="8" fill="#58a6ff" stroke="#ebf4ff" stroke-width="3"/>
+  <rect x="57" y="188" width="24" height="26" rx="6" fill="#bc8cff" stroke="#ebf4ff" stroke-width="2.5"/>
+  <text x="110" y="142" font-family="Segoe UI, Arial, sans-serif" font-weight="800" font-size="94" fill="#58a6ff">F</text>
+  <text x="156" y="190" font-family="Segoe UI, Arial, sans-serif" font-weight="800" font-size="94" fill="#bc8cff">Z</text>
+</svg>
