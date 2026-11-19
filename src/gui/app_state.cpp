@@ -752,7 +752,7 @@ void AppState::render_compress_view() {
         ImGui::TextColored(ImVec4(0.65f, 0.72f, 0.82f, 1.00f), "Codec:  ");
         ImGui::SameLine();
         const char* codecs[] = {
-            "Auto (Best of FZAC / Zstd / Deflate / Store)",
+            "Auto (Best of Zstd / Deflate / Store)",
             "FZAC (Binary Arithmetic + BWT/LZP)",
             "Zstd",
             "Deflate",
@@ -796,7 +796,7 @@ void AppState::render_compress_view() {
             const ImVec2 avail = ImGui::GetContentRegionAvail();
             ImGui::SetCursorPosY(std::max(16.0f, avail.y * 0.34f));
             const char* hint1 = "Drag & Drop Files or Folders Here";
-            const char* hint2 = "Auto mode picks the smallest output across FZAC (BWT+LZP+BAC), Zstd, Deflate, and Store";
+            const char* hint2 = "Auto mode picks the smallest output across standard Zstd, Deflate, and Store";
             const float w1 = ImGui::CalcTextSize(hint1).x;
             const float w2 = ImGui::CalcTextSize(hint2).x;
             ImGui::SetCursorPosX(std::max(10.0f, (avail.x - w1) * 0.5f));
