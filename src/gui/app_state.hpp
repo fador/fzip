@@ -66,7 +66,7 @@ private:
     // Compression inputs
     std::vector<FileItem> input_items_;
     std::string output_archive_path_;
-    int selected_codec_idx_ = 0; // 0 = Auto, 1 = Zstd, 2 = Deflate, 3 = Store
+    int selected_codec_idx_ = 0; // 0 = Auto, 1 = FZAC, 2 = Zstd, 3 = Deflate, 4 = Store
     int compression_level_ = 19;
 
     // Live compression / progress state

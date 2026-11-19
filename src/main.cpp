@@ -32,13 +32,15 @@ void print_usage() {
         "  fzip deflate <archive.zip> <files...> [--level=N]   (Stage 3)\n"
         "  fzip zstd <archive.zip> <files...> [--level=N]      (Stage 4)\n"
         "  fzip auto <archive.zip> <files...> [--level=N]      (Stage 5)\n"
+        "  fzip fzac <archive.zip> <files...> [--level=N]      (Stage 6)\n"
         "\n"
         "A file argument beginning with '@' is treated as a list file: each\n"
         "line is read as one file path (e.g. '@inputs.txt').\n"
         "\n"
         "Levels: deflate 1-12 (9-12 use the optimal parser), zstd 1-22\n"
-        "(19-22 use the optimal parser; 10+ use a large shared window).\n"
-        "`auto` accepts --level to cap the strongest zstd level attempted.\n",
+        "(19-22 use the optimal parser; 10+ use a large shared window),\n"
+        "fzac 1-12 (7-9 use 1-pass DP optimal parser; 10-12 use 2-pass DP).\n"
+        "`auto` accepts --level to cap the strongest zstd/fzac level attempted.\n",
         kVersion);
 }
 
@@ -155,6 +157,10 @@ auto cmd_zstd(int argc, char** argv) -> int {
     return cmd_compress(CodecId::Zstd, 19, "zstd", argc, argv);
 }
 
+auto cmd_fzac(int argc, char** argv) -> int {
+    return cmd_compress(CodecId::Fzac, 9, "fzac", argc, argv);
+}
+
 auto cmd_auto(int argc, char** argv) -> int {
     if (argc < 3) {
         std::fprintf(stderr, "fzip auto: need <archive.zip> <files...>\n");
@@ -247,6 +253,9 @@ auto run(int argc, char** argv) -> int {
     }
     if (cmd == "zstd") {
         return cmd_zstd(argc, argv);
+    }
+    if (cmd == "fzac" || cmd == "bac" || cmd == "lzac") {
+        return cmd_fzac(argc, argv);
     }
     if (cmd == "auto") {
         return cmd_auto(argc, argv);

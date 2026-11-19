@@ -103,6 +103,7 @@ auto parse_cd_entry(const std::byte* p, const std::byte* end,
         case 0: out.codec = CodecId::Store; break;
         case 8: out.codec = CodecId::Deflate; break;
         case 93: out.codec = CodecId::Zstd; break;
+        case 100: out.codec = CodecId::Fzac; break;
         default: out.codec = CodecId::Store; break;  // unknown, try store
     }
 
@@ -242,15 +243,18 @@ auto extract_all(const std::string& archive_path)
     unsigned hw = std::thread::hardware_concurrency();
     if (hw == 0) hw = 1;
     if (n < 2 || hw <= 1) {
+        detail::ThreadBudgetGuard budget(hw);
         for (std::size_t i = 0; i < n; ++i) do_entry(i);
     } else {
         const unsigned nw =
             std::min<unsigned>(hw, static_cast<unsigned>(n));
+        const unsigned per_worker_budget = std::max(1u, hw / nw);
         std::atomic<std::size_t> next{0};
         std::vector<std::thread> workers;
         workers.reserve(nw);
         for (unsigned t = 0; t < nw; ++t) {
             workers.emplace_back([&]() {
+                detail::ThreadBudgetGuard budget(per_worker_budget);
                 for (;;) {
                     std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
                     if (i >= n) break;

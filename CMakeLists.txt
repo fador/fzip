@@ -52,6 +52,7 @@ add_library(fzip_core STATIC
     src/zstd_huffman.cpp
     src/zstd_sequence.cpp
     src/xxhash.cpp
+    src/fzac.cpp
     src/codec.cpp
     src/file_type.cpp)
 target_include_directories(fzip_core PUBLIC src)
@@ -145,3 +146,8 @@ add_test(NAME stage5_auto
             --stage 5 --binary $<TARGET_FILE:fzip>
             --workdir ${CMAKE_BINARY_DIR}/test_tmp5)
 set_tests_properties(stage5_auto PROPERTIES TIMEOUT 60)
+add_test(NAME stage6_fzac
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/verify.py
+            --stage 6 --binary $<TARGET_FILE:fzip>
+            --workdir ${CMAKE_BINARY_DIR}/test_tmp6)
+set_tests_properties(stage6_fzac PROPERTIES TIMEOUT 60)

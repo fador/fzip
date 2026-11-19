@@ -17,6 +17,7 @@ Stages:
     3 — Deflate: fzip deflate; zipfile.testzip() + 7za t + cmp.
     4 — Zstd: fzip zstd; 7za t (zstd-in-zip) + 7za x + cmp.
     5 — Auto: per-file codec selection; 7za t + 7za x + cmp.
+    6 — FZAC: fzip fzac; fzip extract + sha256 cmp across multiple levels.
 """
 from __future__ import annotations
 
@@ -305,6 +306,62 @@ def stage5_auto(binary: Path, workdir: Path, seven_zip: Path) -> bool:
     return ok
 
 
+def stage6_fzac(binary: Path, workdir: Path, seven_zip: Path) -> bool:
+    print("[Stage 6] FZAC binary arithmetic codec round-trip")
+    files = make_small_files(workdir, 4, size=8192)
+
+    txt = workdir / "inputs" / "text.txt"
+    txt.write_text("The quick brown fox jumps over the lazy dog.\n" * 1600)
+    files.append(txt)
+
+    # Structured binary + x86 BCJ-like data (and actual binary copy of 7za.exe)
+    bcj_bin = workdir / "inputs" / "sevenzip_copy.bin"
+    shutil.copyfile(seven_zip, bcj_bin)
+    files.append(bcj_bin)
+
+    # Edge-case: tiny 1-byte and 3-byte files, plus uniform RLE run
+    tiny1 = workdir / "inputs" / "tiny1.bin"
+    tiny1.write_bytes(b"A")
+    files.append(tiny1)
+
+    rle_f = workdir / "inputs" / "rle.bin"
+    rle_f.write_bytes(b"\x55" * 16384 + b"\xAA\xBB" * 4096)
+    files.append(rle_f)
+
+    # Multi-block threshold test (> 4 MiB structured text + binary)
+    multi_f = workdir / "inputs" / "big_multi.bin"
+    text_chunk = (b"<page><title>Wikipedia:Compression</title>"
+                  b"<text>Arithmetic coding and context mixing on large text corpora.</text></page>\n") * 25000
+    bin_chunk = bytes((i * 37 + (i >> 8) * 13) & 0xFF for i in range(512 * 1024))
+    raw_multi = text_chunk + bin_chunk + text_chunk
+    multi_f.write_bytes(raw_multi[:5 * 1024 * 1024])
+    files.append(multi_f)
+
+    for lvl in (1, 6, 12):
+        archive = workdir / f"stage6_l{lvl}.zip"
+        if not check(write_test_zip(binary, archive, files, "fzac",
+                                    extra=[f"--level={lvl}"], workdir=workdir),
+                     f"fzip fzac --level={lvl} succeeds"):
+            return False
+        extract_dir = workdir / f"extract_fzac_l{lvl}"
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+        r = run([str(binary), "extract", str(archive), f"--outdir={extract_dir}"])
+        if not check(r.returncode == 0, f"fzip extract (level={lvl}) succeeds"):
+            print(f"  stderr: {r.stderr[-400:]}")
+            return False
+        for orig in files:
+            extracted = extract_dir / orig.name
+            if not extracted.exists():
+                print(f"  missing: {orig.name}")
+                return False
+            h1 = sha256_file(orig)
+            h2 = sha256_file(extracted)
+            if not check(h1 == h2, f"sha256 match (level={lvl}): {orig.name}"):
+                return False
+    return True
+
+
 STAGES = {
     0: stage0_smoke,
     1: stage1_store,
@@ -312,6 +369,7 @@ STAGES = {
     3: stage3_deflate,
     4: stage4_zstd,
     5: stage5_auto,
+    6: stage6_fzac,
 }
 
 

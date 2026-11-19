@@ -14,6 +14,7 @@ enum class CodecId : std::uint16_t {
     Store = 0,
     Deflate = 8,
     Zstd = 93,
+    Fzac = 100,
 };
 
 // Result of compressing one entry.

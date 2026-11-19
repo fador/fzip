@@ -8,6 +8,7 @@
 
 #include "deflate.hpp"
 #include "file_type.hpp"
+#include "fzac.hpp"
 #include "zstd_codec.hpp"
 
 namespace fzip {
@@ -43,6 +44,11 @@ auto compress_with(CodecId codec, std::span<const std::byte> data,
             if (out.empty()) return make_store_entry(data, omit_store_data);
             return CompressedEntry{CodecId::Zstd, std::move(out)};
         }
+        case CodecId::Fzac: {
+            auto out = fzac_compress(data, level);
+            if (out.empty()) return make_store_entry(data, omit_store_data);
+            return CompressedEntry{CodecId::Fzac, std::move(out)};
+        }
     }
     throw std::runtime_error("unknown codec");
 }
@@ -67,12 +73,32 @@ auto compress_auto_impl(std::span<const std::byte> data,
     constexpr std::size_t kDeflate12Limit = 1u << 20;  // 1 MiB
     const int deflate_level = (data.size() <= kDeflate12Limit) ? 12 : 9;
     const int zstd_level = (level >= 19 && data.size() <= kDeflate12Limit) ? 22 : level;
+    const int fzac_level = (level >= 19)
+                               ? ((data.size() <= kDeflate12Limit) ? 12 : 9)
+                               : std::clamp(level, 1, 9);
 
     std::vector<std::byte> def_out;
     std::vector<std::byte> zst_out;
+    std::vector<std::byte> fzac_out;
 
     const unsigned avail_threads = detail::effective_threads();
-    if (avail_threads >= 2 && data.size() >= 65536) {
+    if (avail_threads >= 3 && data.size() >= 65536) {
+        const unsigned t_each = std::max(1u, avail_threads / 3u);
+        std::thread zst_thread([&]() {
+            detail::ThreadBudgetGuard guard(t_each);
+            zst_out = zstd_compress(data, zstd_level);
+        });
+        std::thread fzac_thread([&]() {
+            detail::ThreadBudgetGuard guard(t_each);
+            fzac_out = fzac_compress(data, fzac_level);
+        });
+        {
+            detail::ThreadBudgetGuard guard(avail_threads - 2u * t_each);
+            def_out = deflate_compress(data, deflate_level);
+        }
+        zst_thread.join();
+        fzac_thread.join();
+    } else if (avail_threads >= 2 && data.size() >= 65536) {
         const unsigned def_threads = std::max(1u, avail_threads / 2);
         const unsigned zst_threads = std::max(1u, avail_threads - def_threads);
         std::thread zst_thread([&]() {
@@ -82,17 +108,23 @@ auto compress_auto_impl(std::span<const std::byte> data,
         {
             detail::ThreadBudgetGuard guard(def_threads);
             def_out = deflate_compress(data, deflate_level);
+            fzac_out = fzac_compress(data, fzac_level);
         }
         zst_thread.join();
     } else {
         def_out = deflate_compress(data, deflate_level);
         zst_out = zstd_compress(data, zstd_level);
+        fzac_out = fzac_compress(data, fzac_level);
     }
 
     const std::size_t raw_size = data.size();
     const std::size_t def_size = def_out.empty() ? raw_size : def_out.size();
     const std::size_t zst_size = zst_out.empty() ? raw_size : zst_out.size();
+    const std::size_t fzac_size = fzac_out.empty() ? raw_size : fzac_out.size();
 
+    if (fzac_size < raw_size && fzac_size <= def_size && fzac_size <= zst_size) {
+        return CompressedEntry{CodecId::Fzac, std::move(fzac_out)};
+    }
     if (def_size < raw_size && def_size <= zst_size) {
         return CompressedEntry{CodecId::Deflate, std::move(def_out)};
     }
@@ -126,6 +158,8 @@ auto decompress_span(CodecId codec, std::span<const std::byte> data,
             return deflate_decompress(data, expected_size);
         case CodecId::Zstd:
             return zstd_decompress(data, expected_size);
+        case CodecId::Fzac:
+            return fzac_decompress(data, expected_size);
     }
     throw std::runtime_error("unknown codec");
 }
@@ -150,6 +184,8 @@ auto decompress(const CompressedEntry& entry) -> std::vector<std::byte> {
             return deflate_decompress(entry.data, 0);
         case CodecId::Zstd:
             return zstd_decompress(entry.data, 0);
+        case CodecId::Fzac:
+            return fzac_decompress(entry.data, 0);
     }
     throw std::runtime_error("unknown codec");
 }

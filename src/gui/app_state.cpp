@@ -46,6 +46,7 @@ const char* codec_name(CodecId id) {
         case CodecId::Store: return "Store";
         case CodecId::Deflate: return "Deflate";
         case CodecId::Zstd: return "Zstd";
+        case CodecId::Fzac: return "FZAC";
     }
     return "Unknown";
 }
@@ -288,8 +289,10 @@ void AppState::start_compression() {
         if (codec_idx == 0) {
             ok = write_zip_auto(out_zip, entries, level, on_prog);
         } else if (codec_idx == 1) {
-            ok = write_zip(out_zip, entries, CodecId::Zstd, level, on_prog);
+            ok = write_zip(out_zip, entries, CodecId::Fzac, level, on_prog);
         } else if (codec_idx == 2) {
+            ok = write_zip(out_zip, entries, CodecId::Zstd, level, on_prog);
+        } else if (codec_idx == 3) {
             ok = write_zip(out_zip, entries, CodecId::Deflate, level, on_prog);
         } else {
             ok = write_zip(out_zip, entries, CodecId::Store, 0, on_prog);
@@ -391,15 +394,15 @@ void AppState::render_compress_view() {
         }
 
         // Codec & Level selection
-        const char* codecs[] = { "Auto (SOTA Best of Zstd/Deflate/Store)", "Zstd", "Deflate", "Store (No Compression)" };
+        const char* codecs[] = { "Auto (SOTA Best of FZAC/Zstd/Deflate/Store)", "FZAC (Binary Arithmetic)", "Zstd", "Deflate", "Store (No Compression)" };
         ImGui::SetNextItemWidth(260);
         ImGui::Combo("Codec", &selected_codec_idx_, codecs, IM_ARRAYSIZE(codecs));
         ImGui::SameLine();
 
-        if (selected_codec_idx_ == 0 || selected_codec_idx_ == 1) {
+        if (selected_codec_idx_ == 0 || selected_codec_idx_ == 2) {
             ImGui::SetNextItemWidth(180);
             ImGui::SliderInt("Level", &compression_level_, 1, 22, "%d (22 = Optimal)");
-        } else if (selected_codec_idx_ == 2) {
+        } else if (selected_codec_idx_ == 1 || selected_codec_idx_ == 3) {
             if (compression_level_ > 12) compression_level_ = 9;
             ImGui::SetNextItemWidth(180);
             ImGui::SliderInt("Level", &compression_level_, 1, 12, "%d (12 = Optimal)");
