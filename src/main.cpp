@@ -39,7 +39,8 @@ void print_usage() {
         "\n"
         "Levels: deflate 1-12 (9-12 use the optimal parser), zstd 1-22\n"
         "(19-22 use the optimal parser; 10+ use a large shared window),\n"
-        "fzac 1-12 (7-9 use 1-pass DP optimal parser; 10-12 use 2-pass DP).\n"
+        "fzac 1-12 (1-6 fast LZ/BWT; 7-9 FZAC v3 Context Mixing + PPMd + WRT/BCJ;\n"
+        "10-12 add online AVX2 neural LSTM with up to 10 GB memory scaling).\n"
         "`auto` accepts --level to cap the strongest zstd level attempted.\n",
         kVersion);
 }

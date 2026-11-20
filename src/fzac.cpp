@@ -18,6 +18,7 @@
 
 #include "codec.hpp"
 #include "file_type.hpp"
+#include "fzac_cm.hpp"
 
 namespace fzip {
 
@@ -48,6 +49,7 @@ constexpr std::uint8_t kMagic0 = 0x46;  // 'F'
 constexpr std::uint8_t kMagic1 = 0x5A;  // 'Z'
 constexpr std::uint8_t kVersionSingle = 1;
 constexpr std::uint8_t kVersionMultiBlock = 2;
+constexpr std::uint8_t kVersionCM = 3;
 
 constexpr std::array<std::uint8_t, kNumStates> kNextStateLit = {
     0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 4, 5
@@ -4185,6 +4187,9 @@ auto fzac_compress(std::span<const std::byte> data, int level)
     if (data.empty()) return {};
 
     level = std::clamp(level, 1, 12);
+    if (level >= 7) {
+        return fzac_v3::fzac_v3_compress(data, level);
+    }
     const auto* raw = reinterpret_cast<const std::uint8_t*>(data.data());
     const unsigned hw = detail::effective_threads();
 
@@ -4300,6 +4305,19 @@ auto fzac_decompress(std::span<const std::byte> data,
         decode_fzac_block(data.data() + hdr_off, data.data() + data.size(),
                           filter_id, lit_mode, pb,
                           reinterpret_cast<std::uint8_t*>(out.data()), n);
+        return out;
+    }
+
+    if (version == kVersionCM) {
+        if (raw_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            throw std::runtime_error("FZAC v3 output size exceeds addressable memory");
+        }
+        std::vector<std::byte> out(static_cast<std::size_t>(raw_size));
+        if (raw_size == 0u) return out;
+        fzac_v3::fzac_v3_decompress(
+            data.data() + hdr_off, data.data() + data.size(), flags,
+            reinterpret_cast<std::uint8_t*>(out.data()),
+            static_cast<std::size_t>(raw_size));
         return out;
     }
 

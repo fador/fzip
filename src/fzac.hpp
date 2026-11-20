@@ -1,12 +1,17 @@
 // fzip — FZAC (fzip Binary Arithmetic Codec) encoder and decoder.
 //
-// Custom state-of-the-art lossless compressor/decompressor combining:
-//   - Carryless 32-bit/64-bit binary arithmetic coding (range coding)
-//   - Dual-rate / dual-context probability mixing
-//   - 12-state LZ77 + 4-repeat-offset (rep0..rep3 + ShortRep) packet model
-//   - Matched-literal bit-trees & adaptive Order-1 / Order-2 literal contexts
-//   - Reversible x86 BCJ (E8/E9) pre-filter with automatic duplicate-target guard
-//   - Hash2 + Hash3 + BT4 match finder with multi-pass forward DP optimal parser
+// Custom state-of-the-art lossless compressor/decompressor:
+//   - Levels 1..6: Fast LZ77 + repeat-offset + BWT/LZP binary arithmetic codec
+//   - Levels 7..12 (FZAC v3): Deep Context Mixing (CM) engine combining:
+//       * Dynamic Universal Word & Structural Token Transform (WRT) with implicit spaces
+//       * Bijective x86/x64 E8/E9 + 0F 8x Jcc executable pre-filter
+//       * Exact Direct O0/O1/O1.5/O2 models with bpos-indexed StateMaps
+//       * Split Low/High 3-way 64-byte cache-line ContextMaps (O3..O15, Sparse, Word, XML, Record, Indirect, Exe)
+//       * 4-way associative long-range Dual MatchModel with 1-byte edit recovery
+//       * Variable-order byte-level PPMd (up to Order-16) with exclusion & SEE
+//       * Multi-layer online byte-level coupled-gate LSTM (levels 10..12, bit-exact AVX2)
+//       * 2-stage multi-context AVX2 Logistic Mixer + 4-stage count-adaptive APM/SSE
+//       * 16-bit precision carryless range coding & parallel large-block scaling (<= 10 GB RAM)
 #pragma once
 
 #include <cstddef>
