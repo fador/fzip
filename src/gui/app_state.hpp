@@ -52,6 +52,7 @@ public:
         bold_font_ = bold_font;
         ui_scale_ = ui_scale;
     }
+    void set_native_window(void* hwnd) { native_hwnd_ = hwnd; }
 
 private:
     void render_header_bar();
@@ -67,6 +68,11 @@ private:
     void set_status(std::string msg);
     auto get_status() -> std::string;
 
+    auto try_join_or_start_ipc(const char* pipe_id,
+                               const std::vector<std::string>& paths) -> bool;
+    void stop_ipc_server();
+    void drain_ipc_paths();
+
 public:
     void add_input_paths(const std::vector<std::string>& paths);
 
@@ -75,12 +81,23 @@ private:
     bool close_requested_ = false;
     ImFont* bold_font_ = nullptr;
     float ui_scale_ = 1.0f;
+    void* native_hwnd_ = nullptr;
 
     // Compression inputs
     std::vector<FileItem> input_items_;
     std::string output_archive_path_;
+    bool auto_output_path_ = true;
     int selected_codec_idx_ = 0;  // 0 = Auto, 1 = FZAC, 2 = Zstd, 3 = Deflate, 4 = Store
     int compression_level_ = 19;
+
+    // Single-instance Explorer multi-select IPC
+    std::mutex ipc_mutex_;
+    std::vector<std::string> pending_ipc_paths_;
+    std::chrono::steady_clock::time_point last_ipc_time_{};
+    bool pending_quick_start_ = false;
+    std::thread ipc_thread_;
+    void* ipc_pipe_handle_ = nullptr;
+    void* ipc_stop_event_ = nullptr;
 
     // Live compression / extraction progress state
     std::atomic<bool> is_working_{false};

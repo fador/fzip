@@ -248,6 +248,7 @@ int main(int argc, char** argv) {
     if (hIconSmall) {
         ::SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hIconSmall));
     }
+    app.set_native_window(hwnd);
 
     const UINT dpi = ::GetDpiForWindow(hwnd);
     const float dpi_scale = (dpi > 0) ? (static_cast<float>(dpi) / 96.0f) : 1.0f;

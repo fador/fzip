@@ -170,9 +170,186 @@ AppState::AppState() {
 }
 
 AppState::~AppState() {
+    stop_ipc_server();
     cancel_operation();
     if (worker_thread_.joinable()) {
         worker_thread_.join();
+    }
+}
+
+auto AppState::try_join_or_start_ipc(const char* pipe_id,
+                                     const std::vector<std::string>& paths) -> bool {
+#if defined(_WIN32)
+    std::wstring wpipe = L"\\\\.\\pipe\\";
+    for (const char* p = pipe_id; *p != '\0'; ++p) {
+        wpipe.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
+    }
+
+    HANDLE hPipe = ::CreateNamedPipeW(
+        wpipe.c_str(),
+        PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1, 0, 16384, 0, nullptr);
+
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        HANDLE hStop = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        ipc_pipe_handle_ = hPipe;
+        ipc_stop_event_ = hStop;
+        {
+            std::lock_guard<std::mutex> lock(ipc_mutex_);
+            last_ipc_time_ = std::chrono::steady_clock::now();
+        }
+        ipc_thread_ = std::thread([this, hPipe, hStop]() {
+            HANDLE hConnEv = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            while (::WaitForSingleObject(hStop, 0) != WAIT_OBJECT_0) {
+                ::ResetEvent(hConnEv);
+                OVERLAPPED ov{};
+                ov.hEvent = hConnEv;
+                BOOL ok = ::ConnectNamedPipe(hPipe, &ov);
+                if (!ok) {
+                    const DWORD err = ::GetLastError();
+                    if (err == ERROR_IO_PENDING) {
+                        HANDLE waits[2] = { hStop, hConnEv };
+                        const DWORD w = ::WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+                        if (w != WAIT_OBJECT_0 + 1) {
+                            ::CancelIoEx(hPipe, &ov);
+                            break;
+                        }
+                    } else if (err != ERROR_PIPE_CONNECTED) {
+                        if (::WaitForSingleObject(hStop, 10) == WAIT_OBJECT_0) break;
+                        continue;
+                    }
+                }
+
+                std::string payload;
+                char buf[4096];
+                for (;;) {
+                    ::ResetEvent(hConnEv);
+                    OVERLAPPED rov{};
+                    rov.hEvent = hConnEv;
+                    DWORD nread = 0;
+                    BOOL rok = ::ReadFile(hPipe, buf, sizeof(buf), &nread, &rov);
+                    if (!rok) {
+                        const DWORD rerr = ::GetLastError();
+                        if (rerr == ERROR_IO_PENDING) {
+                            HANDLE waits[2] = { hStop, hConnEv };
+                            const DWORD rw = ::WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+                            if (rw != WAIT_OBJECT_0 + 1) {
+                                ::CancelIoEx(hPipe, &rov);
+                                break;
+                            }
+                            if (!::GetOverlappedResult(hPipe, &rov, &nread, FALSE)) {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    if (nread == 0) break;
+                    payload.append(buf, nread);
+                }
+
+                std::vector<std::string> incoming;
+                std::size_t start = 0;
+                while (start < payload.size()) {
+                    const std::size_t nl = payload.find('\n', start);
+                    const std::size_t end = (nl == std::string::npos) ? payload.size() : nl;
+                    if (end > start) {
+                        incoming.push_back(payload.substr(start, end - start));
+                    }
+                    if (nl == std::string::npos) break;
+                    start = nl + 1;
+                }
+                if (!incoming.empty()) {
+                    std::lock_guard<std::mutex> lock(ipc_mutex_);
+                    pending_ipc_paths_.insert(
+                        pending_ipc_paths_.end(),
+                        std::make_move_iterator(incoming.begin()),
+                        std::make_move_iterator(incoming.end()));
+                    last_ipc_time_ = std::chrono::steady_clock::now();
+                }
+                ::DisconnectNamedPipe(hPipe);
+            }
+            ::CloseHandle(hConnEv);
+        });
+        return false;
+    }
+
+    std::string payload;
+    for (const auto& p : paths) {
+        if (!p.empty()) {
+            payload += p;
+            payload.push_back('\n');
+        }
+    }
+    for (int attempt = 0; attempt < 30; ++attempt) {
+        HANDLE hClient = ::CreateFileW(
+            wpipe.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hClient != INVALID_HANDLE_VALUE) {
+            std::size_t off = 0;
+            bool write_ok = true;
+            while (off < payload.size()) {
+                DWORD written = 0;
+                const DWORD chunk = static_cast<DWORD>(
+                    std::min<std::size_t>(payload.size() - off, 65536u));
+                if (!::WriteFile(hClient, payload.data() + off, chunk, &written, nullptr)) {
+                    write_ok = false;
+                    break;
+                }
+                off += written;
+            }
+            ::FlushFileBuffers(hClient);
+            ::CloseHandle(hClient);
+            if (write_ok) return true;
+        }
+        ::WaitNamedPipeW(wpipe.c_str(), 150);
+    }
+    return false;
+#else
+    (void)pipe_id;
+    (void)paths;
+    return false;
+#endif
+}
+
+void AppState::stop_ipc_server() {
+#if defined(_WIN32)
+    if (ipc_stop_event_ != nullptr) {
+        ::SetEvent(static_cast<HANDLE>(ipc_stop_event_));
+    }
+    if (ipc_thread_.joinable()) {
+        ipc_thread_.join();
+    }
+    if (ipc_pipe_handle_ != nullptr) {
+        ::CloseHandle(static_cast<HANDLE>(ipc_pipe_handle_));
+        ipc_pipe_handle_ = nullptr;
+    }
+    if (ipc_stop_event_ != nullptr) {
+        ::CloseHandle(static_cast<HANDLE>(ipc_stop_event_));
+        ipc_stop_event_ = nullptr;
+    }
+#endif
+}
+
+void AppState::drain_ipc_paths() {
+    std::vector<std::string> incoming;
+    {
+        std::lock_guard<std::mutex> lock(ipc_mutex_);
+        if (!pending_ipc_paths_.empty()) {
+            incoming.swap(pending_ipc_paths_);
+        }
+    }
+    if (!incoming.empty()) {
+        add_input_paths(incoming);
+#if defined(_WIN32)
+        if (mode_ == AppMode::Compress && native_hwnd_ != nullptr) {
+            HWND hwnd = static_cast<HWND>(native_hwnd_);
+            if (::IsIconic(hwnd)) {
+                ::ShowWindow(hwnd, SW_RESTORE);
+            }
+            ::SetForegroundWindow(hwnd);
+        }
+#endif
     }
 }
 
@@ -194,6 +371,7 @@ void AppState::init(int argc, char** argv) {
 
     if (args.empty()) {
         mode_ = AppMode::Compress;
+        try_join_or_start_ipc("fzip_gui_compress_dialog", {});
         return;
     }
 
@@ -212,17 +390,26 @@ void AppState::init(int argc, char** argv) {
     }
 
     if (first == "--quick-compress") {
+        std::vector<std::string> input_paths(args.begin() + 1, args.end());
+        if (try_join_or_start_ipc("fzip_gui_quick_compress", input_paths)) {
+            close_requested_ = true;
+            return;
+        }
         mode_ = AppMode::QuickProgress;
         is_extract_op_ = false;
-        std::vector<std::string> input_paths(args.begin() + 1, args.end());
         add_input_paths(input_paths);
-        start_compression();
+        pending_quick_start_ = true;
+        set_status("Collecting selected files...");
         return;
     }
 
     if (first == "--compress-dialog") {
-        mode_ = AppMode::Compress;
         std::vector<std::string> input_paths(args.begin() + 1, args.end());
+        if (try_join_or_start_ipc("fzip_gui_compress_dialog", input_paths)) {
+            close_requested_ = true;
+            return;
+        }
+        mode_ = AppMode::Compress;
         add_input_paths(input_paths);
         return;
     }
@@ -294,10 +481,17 @@ void AppState::add_input_paths(const std::vector<std::string>& paths) {
         input_items_.push_back(std::move(item));
     }
 
-    if (output_archive_path_.empty() && !input_items_.empty()) {
+    if (auto_output_path_ && !input_items_.empty()) {
         fs::path first(input_items_[0].path);
-        fs::path dest = first.parent_path() / (first.stem().string() + ".zip");
-        output_archive_path_ = dest.string();
+        fs::path parent = first.parent_path();
+        std::string archive_stem;
+        if (input_items_.size() == 1) {
+            archive_stem = first.stem().string();
+        } else {
+            archive_stem = parent.filename().string();
+            if (archive_stem.empty()) archive_stem = "archive";
+        }
+        output_archive_path_ = (parent / (archive_stem + ".zip")).string();
     }
 }
 
@@ -598,6 +792,24 @@ void AppState::cancel_operation() {
 }
 
 void AppState::render() {
+    drain_ipc_paths();
+
+    if (pending_quick_start_) {
+        std::chrono::steady_clock::time_point last_t;
+        {
+            std::lock_guard<std::mutex> lock(ipc_mutex_);
+            last_t = last_ipc_time_;
+        }
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - last_t).count();
+        if (elapsed_ms >= 250) {
+            pending_quick_start_ = false;
+            stop_ipc_server();
+            drain_ipc_paths();
+            start_compression();
+        }
+    }
+
     if (is_working_.load()) {
         const auto now = std::chrono::steady_clock::now();
         elapsed_seconds_ = std::chrono::duration<double>(now - start_time_).count();
@@ -742,6 +954,8 @@ void AppState::render_compress_view() {
     ImGui::SameLine();
     if (ImGui::Button("Clear List")) {
         input_items_.clear();
+        output_archive_path_.clear();
+        auto_output_path_ = true;
         std::lock_guard<std::mutex> lock(rows_mutex_);
         rows_.clear();
     }
@@ -780,12 +994,16 @@ void AppState::render_compress_view() {
         ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - browse_w - 10.0f));
         if (ImGui::InputText("##outpath", buf, sizeof(buf))) {
             output_archive_path_ = buf;
+            auto_output_path_ = false;
         }
         ImGui::SameLine();
         if (ImGui::Button("Browse...", ImVec2(browse_w, 0))) {
             auto s = pick_save_file(
                 output_archive_path_.empty() ? "archive.zip" : output_archive_path_);
-            if (!s.empty()) output_archive_path_ = s;
+            if (!s.empty()) {
+                output_archive_path_ = s;
+                auto_output_path_ = false;
+            }
         }
 
         ImGui::AlignTextToFramePadding();

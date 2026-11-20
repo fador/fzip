@@ -55,11 +55,15 @@ bool register_verb(const std::wstring& shell_root,
                    const std::wstring& key_name,
                    const std::wstring& label,
                    const std::wstring& icon,
-                   const std::wstring& command) {
+                   const std::wstring& command,
+                   const wchar_t* multi_select_model = nullptr) {
     const std::wstring base = shell_root + L"\\" + key_name;
     bool ok = true;
     ok &= reg_set_string(HKEY_CURRENT_USER, base, L"", label);
     ok &= reg_set_string(HKEY_CURRENT_USER, base, L"Icon", icon);
+    if (multi_select_model != nullptr) {
+        ok &= reg_set_string(HKEY_CURRENT_USER, base, L"MultiSelectModel", multi_select_model);
+    }
     ok &= reg_set_string(HKEY_CURRENT_USER, base + L"\\command", L"", command);
     return ok;
 }
@@ -96,9 +100,9 @@ auto register_context_menu(const std::string& exe_path) -> bool {
              L"Software\\Classes\\Directory\\shell",
          }) {
         ok &= register_verb(root, L"fzip.compress", L"Compress with fzip...",
-                            icon_compress, quote_exe + L" --compress-dialog \"%1\"");
+                            icon_compress, quote_exe + L" --compress-dialog \"%1\"", L"Player");
         ok &= register_verb(root, L"fzip.quick", L"Quick Compress to .zip (fzip)",
-                            icon_compress, quote_exe + L" --quick-compress \"%1\"");
+                            icon_compress, quote_exe + L" --quick-compress \"%1\"", L"Player");
     }
 
     // 2. .zip archives across all Explorer association lookup paths
