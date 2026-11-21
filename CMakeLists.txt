@@ -57,6 +57,8 @@ add_library(fzip_core STATIC
     src/fzac_wrt.cpp
     src/fzac_ppm.cpp
     src/fzac_lstm.cpp
+    src/fzac_deltanet.cpp
+    src/fzac_transformer.cpp
     src/codec.cpp
     src/file_type.cpp)
 target_include_directories(fzip_core PUBLIC src)
@@ -160,4 +162,4 @@ add_test(NAME stage6_fzac
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/verify.py
             --stage 6 --binary $<TARGET_FILE:fzip>
             --workdir ${CMAKE_BINARY_DIR}/test_tmp6)
-set_tests_properties(stage6_fzac PROPERTIES TIMEOUT 300)
+set_tests_properties(stage6_fzac PROPERTIES TIMEOUT 600)

@@ -11,12 +11,15 @@ namespace fzip::fzac_v3 {
 // Feature flags stored in the FZAC v3 stream header so the decoder always
 // instantiates the exact same model ensemble and hash table sizes.
 enum CmFlags : std::uint8_t {
-    kCmNone       = 0x00u,
-    kCmPPM        = 0x01u,  // Variable-order byte-level PPMd predictor
-    kCmLSTM       = 0x02u,  // Online byte-level neural (LSTM/GRU) predictor
-    kCmExe        = 0x04u,  // x86/x64 instruction & executable context model
-    kCmDeepOrders = 0x08u,  // Extra high orders (O10..O16) & deeper MatchModel
-    kCmTextMode   = 0x10u,  // Enhanced text/XML/word/tag models
+    kCmNone        = 0x00u,
+    kCmPPM         = 0x01u,  // Variable-order byte-level PPMd predictor
+    kCmLSTM        = 0x02u,  // Online byte-level neural (LSTM) predictor
+    kCmExe         = 0x04u,  // x86/x64 instruction & executable context model
+    kCmDeepOrders  = 0x08u,  // Extra high orders (O10..O16) & deeper MatchModel
+    kCmTextMode    = 0x10u,  // Enhanced text/XML/word/tag models
+    kCmDeltaNet    = 0x20u,  // Online DeltaNet associative matrix-memory RNN
+    kCmNeuralMix   = 0x40u,  // Residual nonlinear MLP meta-mixer + neural APM
+    kCmTransformer = 0x80u,  // Compact online causal Transformer predictor
 };
 
 enum TransformId : std::uint8_t {

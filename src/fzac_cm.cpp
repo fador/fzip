@@ -10,8 +10,10 @@
 //   - 3-Stage Count-Adaptive Cascaded APM / SSE + 16-bit Precision Carryless Range Coder
 #include "codec.hpp"
 #include "fzac_cm.hpp"
+#include "fzac_deltanet.hpp"
 #include "fzac_lstm.hpp"
 #include "fzac_ppm.hpp"
+#include "fzac_transformer.hpp"
 #include "fzac_wrt.hpp"
 
 #include <algorithm>
@@ -1676,6 +1678,9 @@ class CmPredictor {
           wrt_mode_(cfg.transform == kTransformWrt),
           use_ppm_((cfg.flags & kCmPPM) != 0u),
           use_lstm_((cfg.flags & kCmLSTM) != 0u),
+          use_deltanet_((cfg.flags & kCmDeltaNet) != 0u),
+          use_transformer_((cfg.flags & kCmTransformer) != 0u),
+          use_neural_mix_((cfg.flags & kCmNeuralMix) != 0u),
           budget_(budget_for_mem_level(cfg.mem_level)),
           cm_low_(budget_.cm_low_bytes, kNumLowModels),
           cm_high_(budget_.cm_high_bytes, kNumHighModels),
@@ -1700,6 +1705,18 @@ class CmPredictor {
             const std::size_t num_layers = (lstm_tier >= 2u) ? 2u : 1u;
             lstm_ = std::make_unique<LstmModel>(num_layers, 64u, 32u);
         }
+        if (use_deltanet_) {
+            deltanet_ = std::make_unique<DeltaNetModel>(4u, 32u, 64u, 16u);
+        }
+        if (use_transformer_) {
+            transformer_ = std::make_unique<TransformerModel>(64u, 4u, 64u, 16u);
+        }
+        if (use_neural_mix_) {
+            meta_mix_dis_ = std::make_unique<LogisticMixer>(16u, 4u * 4u * 8u * 4u, std::int16_t{340});
+            if (use_lstm_) {
+                apm_neural_ = std::make_unique<APM>(16u * 4u * 8u * 4u);
+            }
+        }
         inputs_.fill(0);
         meta_inputs_.fill(0);
     }
@@ -1718,6 +1735,8 @@ class CmPredictor {
         match_.on_byte(pos);
         if (ppm_) ppm_->start_byte(pos);
         if (lstm_) lstm_->start_byte();
+        if (deltanet_) deltanet_->start_byte();
+        if (transformer_) transformer_->start_byte();
 
         // Single rolling scan over last 15 bytes
         std::array<std::uint64_t, 16> ro{};
@@ -1822,11 +1841,42 @@ class CmPredictor {
         const std::int16_t ppm_high = ppm_ ? stretch_p12(ppm_->predict_high_order_bit(c0_)) : std::int16_t{0};
         inputs_[n_in++] = ppm_full;
         inputs_[n_in++] = ppm_high;
-        // [36] Online Byte-Level LSTM Neural Predictor!
+        // [39] Online Byte-Level LSTM Neural Predictor!
         const std::int16_t lstm_logit = lstm_ ? stretch_p12(lstm_->predict_bit(c0_)) : std::int16_t{0};
         inputs_[n_in++] = lstm_logit;
-        // [37] Constant bias (+1.0 nat)
+        // [40] Constant bias (+1.0 nat)
         inputs_[n_in++] = 256;
+        // [41] Online Gated DeltaNet Associative Matrix-Memory RNN!
+        const std::int16_t dn_logit = deltanet_ ? stretch_p12(deltanet_->predict_bit(c0_)) : std::int16_t{0};
+        if (use_deltanet_) {
+            inputs_[n_in++] = dn_logit;
+        }
+        // [42] Compact Online Causal Self-Attention Transformer!
+        const std::int16_t tf_logit = transformer_ ? stretch_p12(transformer_->predict_bit(c0_)) : std::int16_t{0};
+        if (use_transformer_) {
+            inputs_[n_in++] = tf_logit;
+        }
+        // [43] Cross-paradigm nonlinear agreement conjunction (PPM x Match/Neural)
+        std::int16_t conj_logit = 0;
+        if (use_neural_mix_) {
+            const std::int32_t a = use_ppm_ ? static_cast<std::int32_t>(ppm_full) : static_cast<std::int32_t>(inputs_[4]);
+            std::int32_t b = static_cast<std::int32_t>(inputs_[6]);
+            if (use_lstm_ || use_deltanet_ || use_transformer_) {
+                std::int32_t nsum = 0;
+                std::int32_t ncnt = 0;
+                if (use_lstm_)        { nsum += lstm_logit; ++ncnt; }
+                if (use_deltanet_)    { nsum += dn_logit;   ++ncnt; }
+                if (use_transformer_) { nsum += tf_logit;   ++ncnt; }
+                b = nsum / ncnt;
+            }
+            if ((a > 0 && b > 0) || (a < 0 && b < 0)) {
+                const std::int32_t abs_a = (a < 0) ? -a : a;
+                const std::int32_t abs_b = (b < 0) ? -b : b;
+                const std::int32_t m = (abs_a < abs_b) ? abs_a : abs_b;
+                conj_logit = static_cast<std::int16_t>((a > 0) ? m : -m);
+            }
+            inputs_[n_in++] = conj_logit;
+        }
         while (n_in < kMixerInputs) inputs_[n_in++] = 0;
 
         const std::uint32_t mb = match_.mixer_bucket();
@@ -1841,7 +1891,7 @@ class CmPredictor {
         const std::size_t mctx_c12 =
             ((static_cast<std::size_t>(c2_ >> 4) << 7) | (static_cast<std::size_t>(c1_ >> 4) << 3) | ubpos);
 
-        // 5 Stage-1 Logistic Mixers -> Stage-2 Meta-Mixer
+        // 5 Stage-1 Logistic Mixers -> Stage-2 Meta-Mixer(s)
         meta_inputs_[0] = static_cast<std::int16_t>(mix_c1_.predict(inputs_.data(), mctx_c1));
         meta_inputs_[1] = static_cast<std::int16_t>(mix_c0_.predict(inputs_.data(), mctx_c0));
         meta_inputs_[2] = static_cast<std::int16_t>(mix_state_.predict(inputs_.data(), mctx_st));
@@ -1856,13 +1906,41 @@ class CmPredictor {
         meta_inputs_[10] = ppm_high;     // highest-order PPM
         meta_inputs_[11] = lstm_logit;   // online neural LSTM
         meta_inputs_[12] = 256;          // bias
+        meta_inputs_[13] = dn_logit;     // online neural DeltaNet
+        meta_inputs_[14] = tf_logit;     // online causal Transformer
+        meta_inputs_[15] = conj_logit;   // cross-paradigm nonlinear agreement
 
         const std::size_t meta_ctx = ((static_cast<std::size_t>(mb) << 5) |
                                       (ubpos << 2) | c1_cls_);
-        const std::int32_t s_mix = meta_mix_.predict(meta_inputs_.data(), meta_ctx);
+        std::int32_t s_mix = meta_mix_.predict(meta_inputs_.data(), meta_ctx);
+        if (meta_mix_dis_) {
+            // Compute cross-paradigm disagreement bucket (0..3) and neural/mixer confidence (0..3)
+            std::int32_t p_lo = meta_inputs_[2];
+            std::int32_t p_hi = meta_inputs_[2];
+            auto acc_range = [&](std::int16_t v) {
+                if (v < p_lo) p_lo = v;
+                if (v > p_hi) p_hi = v;
+            };
+            acc_range(inputs_[6]);
+            if (use_ppm_) acc_range(ppm_full);
+            if (use_lstm_) acc_range(lstm_logit);
+            if (use_deltanet_) acc_range(dn_logit);
+            if (use_transformer_) acc_range(tf_logit);
+            const std::uint32_t spread = static_cast<std::uint32_t>(p_hi - p_lo);
+            const std::uint32_t dis_b = (spread < 256u) ? 0u : ((spread < 768u) ? 1u : ((spread < 1536u) ? 2u : 3u));
+            const std::uint32_t conf_b = use_transformer_ ? transformer_->conf_bucket()
+                                       : (use_deltanet_   ? deltanet_->conf_bucket()
+                                       : (use_lstm_       ? lstm_->conf_bucket()
+                                                          : static_cast<std::uint32_t>(std::min<std::int32_t>(std::abs(s_mix) >> 9, 3))));
+            const std::size_t dis_ctx = (static_cast<std::size_t>(dis_b) << 7) |
+                                        (static_cast<std::size_t>(conf_b) << 5) |
+                                        (static_cast<std::size_t>(ubpos) << 2) | mb;
+            const std::int32_t s_dis = meta_mix_dis_->predict(meta_inputs_.data(), dis_ctx);
+            s_mix = (s_mix + s_dis) >> 1;
+        }
         const std::uint32_t p_mix16 = squash_to_16(s_mix);
 
-        // 4-Stage Count-Adaptive Cascaded APM / SSE
+        // 4-Stage Count-Adaptive Cascaded APM / SSE (+ optional 5th Neural-State APM)
         const std::uint32_t p_apm1 = apm1_.predict(s_mix, c0_ & 255u);
         const std::uint32_t p1 = (3u * p_apm1 + p_mix16) >> 2;
         const std::int32_t s1 = stretch_p12(p1 >> 4);
@@ -1878,7 +1956,15 @@ class CmPredictor {
         const std::size_t apm3_ctx = (((static_cast<std::size_t>(mb) << 2) | c1_cls_) << 4) |
                                      (ubpos << 1) | last_err_;
         const std::uint32_t p_apm3 = apm3_.predict(s3, apm3_ctx);
-        const std::uint32_t p_final = (3u * p_apm3 + p3) >> 2;
+        std::uint32_t p_final = (3u * p_apm3 + p3) >> 2;
+        if (apm_neural_) {
+            const std::size_t n_ctx =
+                (static_cast<std::size_t>(lstm_->state_hash()) << 7) |
+                (static_cast<std::size_t>(lstm_->conf_bucket()) << 5) |
+                (static_cast<std::size_t>(ubpos) << 2) | mb;
+            const std::uint32_t p_n = apm_neural_->predict(stretch_p12(p_final >> 4), n_ctx);
+            p_final = (3u * p_final + p_n) >> 2;
+        }
         last_p_final_ = std::clamp<std::uint32_t>(p_final, 1u, 65535u);
         return last_p_final_;
     }
@@ -1891,7 +1977,9 @@ class CmPredictor {
         apm2_.update(bit);
         apm4_.update(bit);
         apm3_.update(bit);
+        if (apm_neural_) apm_neural_->update(bit);
 
+        if (meta_mix_dis_) meta_mix_dis_->update(meta_inputs_.data(), bit, 2, 10);
         meta_mix_.update(meta_inputs_.data(), bit, 2, 10);
         mix_c1_.update(inputs_.data(), bit, 2, 12);
         mix_c0_.update(inputs_.data(), bit, 2, 10);
@@ -1918,7 +2006,13 @@ class CmPredictor {
         ind_.update(byte, c1_, c2_);
         if (exe_mode_) exe_.update(byte);
         if (ppm_) ppm_->update_byte(pos_, byte);
-        if (lstm_) lstm_->update_byte(byte);
+        if (lstm_ || deltanet_ || transformer_) {
+            const std::uint32_t bigram = (static_cast<std::uint32_t>(c1_) << 8) | byte;
+            const std::uint32_t tok_id = (bigram * 2654435761u) >> 21;
+            if (lstm_) lstm_->update_byte(byte, tok_id);
+            if (deltanet_) deltanet_->update_byte(byte, tok_id);
+            if (transformer_) transformer_->update_byte(byte, tok_id);
+        }
     }
 
   private:
@@ -1929,6 +2023,9 @@ class CmPredictor {
     bool wrt_mode_;
     bool use_ppm_;
     bool use_lstm_;
+    bool use_deltanet_;
+    bool use_transformer_;
+    bool use_neural_mix_;
     MemBudget budget_;
 
     ContextMap cm_low_;
@@ -1937,6 +2034,10 @@ class CmPredictor {
     MatchModel match_;
     std::unique_ptr<PpmModel> ppm_;
     std::unique_ptr<LstmModel> lstm_;
+    std::unique_ptr<DeltaNetModel> deltanet_;
+    std::unique_ptr<TransformerModel> transformer_;
+    std::unique_ptr<LogisticMixer> meta_mix_dis_;
+    std::unique_ptr<APM> apm_neural_;
     WordTracker word_;
     RecordTracker rec_;
     IndirectTracker ind_;
@@ -2000,12 +2101,21 @@ auto choose_cm_config(std::span<const std::byte> data, int level) -> CmConfig {
     }
     if (level >= 9) {
         cfg.flags |= kCmDeepOrders;
+        if (n >= 4096u) {
+            cfg.flags |= kCmNeuralMix;
+        }
     }
     if (level >= 10 && n >= 4096u) {
         cfg.flags |= kCmLSTM;
-        // extra bits 1..2: 1 -> H=64 (L10-11), 2 -> H=96 (L12)
+        // extra bits 1..2: 1 -> 1-layer H=64 (L10-11), 2 -> 2-layer H=64 (L12)
         const std::uint8_t lstm_tier = (level >= 12) ? 2u : 1u;
         cfg.extra |= static_cast<std::uint8_t>(lstm_tier << 1);
+    }
+    if (level >= 11 && n >= 4096u) {
+        cfg.flags |= kCmDeltaNet;
+    }
+    if (level >= 12 && n >= 4096u) {
+        cfg.flags |= kCmTransformer;
     }
 
     bool use_jcc = false;
